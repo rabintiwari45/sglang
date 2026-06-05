@@ -82,7 +82,9 @@ dependencies = [
   "watchfiles",
   "xgrammar==0.2.0",
   "smg-grpc-servicer>=0.5.0",
-  "kernels",
+  # transformers 5.8.x hub_kernels creates LayerRepository without version=;
+  # kernels>=0.15 raises ValueError at import time.
+  "kernels>=0.11,<0.15",
 ]
 
 [[tool.uv.index]]

@@ -1324,6 +1324,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if not self.is_draft_worker:
             get_offloader().post_init()
 
+        if self.server_args.enable_expert_vm:
+            from sglang.srt.layers.moe.expert_vm import finalize_expert_vm_after_load
+
+            finalize_expert_vm_after_load(self.model)
+
         # Register model for layerwise NVTX profiling if enabled
         if self.server_args.enable_layerwise_nvtx_marker:
             pyt_hooks = PytHooks()

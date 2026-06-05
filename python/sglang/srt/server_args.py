@@ -694,6 +694,10 @@ class ServerArgs:
     offload_prefetch_step: int = 1
     offload_mode: str = "cpu"
 
+    # MoE expert virtual memory (CPU-backed experts, layer-wise GPU staging)
+    enable_expert_vm: bool = False
+    expert_vm_resident_layers: str = "0"
+
     # Scoring configuration
     # Enable Multi-Item Scoring optimization. Combines query and multiple items
     # into a single sequence for efficient batch processing. Item boundaries are
@@ -973,6 +977,7 @@ class ServerArgs:
         self._handle_eplb_and_dispatch()
         self._handle_expert_distribution_metrics()
         self._handle_elastic_ep()
+        self._handle_expert_vm()
 
         # Handle pipeline parallelism.
         self._handle_pipeline_parallelism()
@@ -1346,6 +1351,9 @@ class ServerArgs:
             self.disable_piecewise_cuda_graph = True
         # 11. CPU offload (breaks dynamo)
         if self.cpu_offload_gb > 0 or self.enable_hierarchical_cache:
+            self.disable_piecewise_cuda_graph = True
+        # 11b. MoE expert VM (dynamic GPU staging per layer)
+        if self.enable_expert_vm:
             self.disable_piecewise_cuda_graph = True
         # 12. Deterministic inference
         if self.enable_deterministic_inference:
@@ -3451,6 +3459,36 @@ class ServerArgs:
             assert (
                 self.elastic_ep_backend is not None
             ), "Elastic EP rejoin requires elastic_ep_backend to be set."
+
+    def _handle_expert_vm(self):
+        if not self.enable_expert_vm:
+            return
+        if self.cpu_offload_gb > 0:
+            raise ValueError(
+                "--enable-expert-vm cannot be used with --cpu-offload-gb > 0."
+            )
+        if self.offload_group_size > 0:
+            raise ValueError(
+                "--enable-expert-vm cannot be used with layer offloading "
+                "(--offload-group-size > 0)."
+            )
+        if self.tp_size != 1:
+            raise ValueError(
+                "--enable-expert-vm currently requires --tp-size 1 (single GPU)."
+            )
+        if self.ep_size > 1:
+            raise ValueError(
+                "--enable-expert-vm currently requires expert parallel size 1."
+            )
+        if self.pp_size > 1:
+            raise ValueError(
+                "--enable-expert-vm currently requires --pp-size 1."
+            )
+        logger.info(
+            "Expert VM enabled: MoE expert weights for layers %s stay on GPU; "
+            "all other MoE layers use pinned CPU RAM.",
+            self.expert_vm_resident_layers,
+        )
 
     def _handle_expert_distribution_metrics(self):
         if self.enable_expert_distribution_metrics and (
@@ -6175,6 +6213,23 @@ class ServerArgs:
             default=ServerArgs.offload_mode,
             help="Mode of offloading.",
         )
+        parser.add_argument(
+            "--enable-expert-vm",
+            action="store_true",
+            help=(
+                "Store non-resident MoE expert weights in pinned CPU RAM after load. "
+                "Only layers listed in --expert-vm-resident-layers keep all experts on GPU."
+            ),
+        )
+        parser.add_argument(
+            "--expert-vm-resident-layers",
+            type=str,
+            default=ServerArgs.expert_vm_resident_layers,
+            help=(
+                "Comma-separated MoE layer ids whose expert weights stay on GPU "
+                "(default: 0 = first layer only)."
+            ),
+        )
 
         # Args for multi-item-scoring
         parser.add_argument(
@@ -7608,6 +7663,11 @@ _global_server_args: Optional[ServerArgs] = None
 def set_global_server_args_for_scheduler(server_args: ServerArgs):
     global _global_server_args
     _global_server_args = server_args
+    from sglang.srt.layers.moe.expert_vm.config import (
+        set_expert_vm_config_from_server_args,
+    )
+
+    set_expert_vm_config_from_server_args(server_args)
 
 
 set_global_server_args_for_tokenizer = set_global_server_args_for_scheduler

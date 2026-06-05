@@ -189,6 +189,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         with_bias: bool = False,
         **extra_weight_attrs,
     ):
+        from sglang.srt.layers.moe.expert_vm.alloc import empty_expert_weight
+
         self.with_bias = with_bias
 
         # Fused gate_up_proj (column parallel)
@@ -201,19 +203,27 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         if self.use_triton_kernels:
             w13_weight_n, w13_weight_k = w13_weight_k, w13_weight_n
         w13_weight = torch.nn.Parameter(
-            torch.empty(num_experts, w13_weight_n, w13_weight_k, dtype=params_dtype),
+            empty_expert_weight(
+                layer, (num_experts, w13_weight_n, w13_weight_k), params_dtype
+            ),
             requires_grad=False,
         )
         layer.register_parameter("w13_weight", w13_weight)
         set_weight_attrs(w13_weight, extra_weight_attrs)
+        if w13_weight.device.type == "cpu":
+            setattr(w13_weight, "expert_vm_cpu_weight", True)
 
         if self.with_bias:
             w13_weight_bias = torch.nn.Parameter(
-                torch.empty(num_experts, w13_up_dim, dtype=torch.float32),
+                empty_expert_weight(
+                    layer, (num_experts, w13_up_dim), torch.float32
+                ),
                 requires_grad=False,
             )
             layer.register_parameter("w13_weight_bias", w13_weight_bias)
             set_weight_attrs(w13_weight_bias, extra_weight_attrs)
+            if w13_weight_bias.device.type == "cpu":
+                setattr(w13_weight_bias, "expert_vm_cpu_weight", True)
 
         # down_proj (row parallel)
         w2_weight_n, w2_weight_k = (
@@ -223,19 +233,27 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         if self.use_triton_kernels:
             w2_weight_n, w2_weight_k = w2_weight_k, w2_weight_n
         w2_weight = torch.nn.Parameter(
-            torch.empty(num_experts, w2_weight_n, w2_weight_k, dtype=params_dtype),
+            empty_expert_weight(
+                layer, (num_experts, w2_weight_n, w2_weight_k), params_dtype
+            ),
             requires_grad=False,
         )
         layer.register_parameter("w2_weight", w2_weight)
         set_weight_attrs(w2_weight, extra_weight_attrs)
+        if w2_weight.device.type == "cpu":
+            setattr(w2_weight, "expert_vm_cpu_weight", True)
 
         if self.with_bias:
             w2_weight_bias = torch.nn.Parameter(
-                torch.empty(num_experts, hidden_size, dtype=torch.float32),
+                empty_expert_weight(
+                    layer, (num_experts, hidden_size), torch.float32
+                ),
                 requires_grad=False,
             )
             layer.register_parameter("w2_weight_bias", w2_weight_bias)
             set_weight_attrs(w2_weight_bias, extra_weight_attrs)
+            if w2_weight_bias.device.type == "cpu":
+                setattr(w2_weight_bias, "expert_vm_cpu_weight", True)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         _should_use_aiter_moe = _use_aiter and (
