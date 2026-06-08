@@ -329,6 +329,12 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
         topk_output = self.topk(hidden_states, router_logits)
+
+        if getattr(self.experts, "_expert_vm_offloaded", False):
+            from sglang.srt.layers.moe.expert_vm.prefetch import expert_vm_begin_prefetch
+
+            expert_vm_begin_prefetch(self.experts, topk_output)
+
         final_hidden_states = self.experts(hidden_states, topk_output)
 
         if self.ep_size > 1 and not should_skip_post_experts_all_reduce(

@@ -1,5 +1,5 @@
 # Expert virtual memory: CPU-backed MoE experts with layer-wise GPU staging.
-# Manager symbols are lazy-loaded to avoid import cycles with FusedMoE / model_config.
+# Heavy imports are lazy-loaded to avoid import cycles with FusedMoE / model_config.
 
 from __future__ import annotations
 
@@ -25,12 +25,23 @@ _LAZY_MANAGER_EXPORTS = {
     "maybe_stage_expert_vm_gpu_weights": "maybe_stage_expert_vm_gpu_weights",
 }
 
+_LAZY_PREFETCH_EXPORTS = {
+    "expert_vm_begin_lookahead_during_compute": "expert_vm_begin_lookahead_during_compute",
+    "expert_vm_begin_prefetch": "expert_vm_begin_prefetch",
+    "expert_vm_release": "expert_vm_release",
+    "expert_vm_wait_and_bind": "expert_vm_wait_and_bind",
+}
+
 
 def __getattr__(name: str) -> Any:
     if name in _LAZY_MANAGER_EXPORTS:
         from sglang.srt.layers.moe.expert_vm import manager as _manager_mod
 
         return getattr(_manager_mod, _LAZY_MANAGER_EXPORTS[name])
+    if name in _LAZY_PREFETCH_EXPORTS:
+        from sglang.srt.layers.moe.expert_vm import prefetch as _prefetch_mod
+
+        return getattr(_prefetch_mod, _LAZY_PREFETCH_EXPORTS[name])
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
@@ -38,6 +49,10 @@ __all__ = [
     "empty_expert_weight",
     "ExpertVMConfig",
     "ExpertVMManager",
+    "expert_vm_begin_lookahead_during_compute",
+    "expert_vm_begin_prefetch",
+    "expert_vm_release",
+    "expert_vm_wait_and_bind",
     "finalize_expert_vm_after_load",
     "should_allocate_expert_weights_on_cpu",
     "get_expert_vm_config",

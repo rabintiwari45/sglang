@@ -156,33 +156,18 @@ def finalize_expert_vm_after_load(model: nn.Module) -> None:
         return
     _manager = ExpertVMManager(config)
     _manager.finalize_after_load(model)
+    from sglang.srt.layers.moe.expert_vm.prefetch import register_expert_vm_sparse_blocks
+
+    register_expert_vm_sparse_blocks(model)
 
 
 def maybe_stage_expert_vm_gpu_weights(layer: FusedMoE) -> None:
-    """Copy CPU expert weights into GPU parameters before MoE compute."""
-    if not getattr(layer, "_expert_vm_offloaded", False):
-        return
-
-    device = torch.device("cuda", torch.cuda.current_device())
-    for name in get_expert_vm_param_names(layer):
-        cpu_buf = getattr(layer, f"expert_vm_{name}_cpu", None)
-        if cpu_buf is None:
-            continue
-        param = getattr(layer, name)
-        if param.data.numel() == 0:
-            param.data = torch.empty(cpu_buf.shape, dtype=cpu_buf.dtype, device=device)
-        param.data.copy_(cpu_buf, non_blocking=False)
+    """Deprecated v1 full-layer staging; no-op when selective prefetch is used."""
+    return
 
 
 def maybe_release_expert_vm_gpu_weights(layer: FusedMoE) -> None:
-    """Free GPU expert weight storage after MoE compute (CPU copy retained)."""
-    if not getattr(layer, "_expert_vm_offloaded", False):
-        return
+    """Release selective GPU staging after MoE forward."""
+    from sglang.srt.layers.moe.expert_vm.prefetch import expert_vm_release
 
-    device = torch.device("cuda", torch.cuda.current_device())
-    for name in get_expert_vm_param_names(layer):
-        if not hasattr(layer, name):
-            continue
-        param = getattr(layer, name)
-        if param.data.numel() > 0:
-            param.data = torch.empty(0, device=device, dtype=param.dtype)
+    expert_vm_release(layer)

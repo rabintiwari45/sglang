@@ -1084,16 +1084,20 @@ class FusedMoE(torch.nn.Module):
             return self.forward_impl(hidden_states, topk_output)
 
     def forward_impl(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
-        from sglang.srt.layers.moe.expert_vm import (
+        from sglang.srt.layers.moe.expert_vm.prefetch import (
+            expert_vm_begin_lookahead_during_compute,
+            expert_vm_wait_and_bind,
+        )
+        from sglang.srt.layers.moe.expert_vm.manager import (
             maybe_release_expert_vm_gpu_weights,
-            maybe_stage_expert_vm_gpu_weights,
         )
 
         origin_hidden_states_dim = hidden_states.shape[-1]
         assert self.quant_method is not None
 
-        maybe_stage_expert_vm_gpu_weights(self)
+        topk_output = expert_vm_wait_and_bind(self, topk_output)
         try:
+            expert_vm_begin_lookahead_during_compute(self, hidden_states)
             dispatch_output = self.dispatcher.dispatch(
                 hidden_states=hidden_states, topk_output=topk_output
             )

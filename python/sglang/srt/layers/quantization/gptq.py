@@ -1326,6 +1326,9 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
                 setattr(param, "expert_vm_cpu_weight", True)
             return param
 
+        # Marlin MoE kernels require scale dtype == activation dtype (see
+        # fused_marlin_moe); match GPTQMarlinLinearMethod and use params_dtype.
+        self._params_dtype = params_dtype
         self.is_k_full = (not self.quant_config.desc_act) or layer.moe_tp_size == 1
 
         if self.quant_config.group_size != -1:
@@ -1367,14 +1370,14 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
         # up_proj scales
         w13_scales = _expert_param(
             (num_experts, scales_size13, 2 * intermediate_size_per_partition),
-            torch.half,
+            params_dtype,
         )
         layer.register_parameter("w13_scales", w13_scales)
         set_weight_attrs(w13_scales, extra_weight_attrs)
         # down_proj scales
         w2_scales = _expert_param(
             (num_experts, scales_size2, hidden_size),
-            torch.half,
+            params_dtype,
         )
         layer.register_parameter("w2_scales", w2_scales)
         set_weight_attrs(w2_scales, extra_weight_attrs)
@@ -1503,6 +1506,16 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
             group_size=self.quant_config.group_size,
         )
         replace_parameter(layer, "w2_scales", marlin_w2_scales)
+
+        act_dtype = getattr(self, "_params_dtype", layer.w13_scales.dtype)
+        if layer.w13_scales.dtype != act_dtype:
+            replace_parameter(
+                layer, "w13_scales", layer.w13_scales.to(dtype=act_dtype)
+            )
+        if layer.w2_scales.dtype != act_dtype:
+            replace_parameter(
+                layer, "w2_scales", layer.w2_scales.to(dtype=act_dtype)
+            )
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
