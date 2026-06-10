@@ -50,6 +50,37 @@ def expert_sets_match(
     )
 
 
+def _expert_ids_as_sorted_list(ids: torch.Tensor) -> list[int]:
+    if ids.numel() == 0:
+        return []
+    return sorted(int(x) for x in ids.to("cpu", torch.int64).tolist())
+
+
+def expert_ids_as_sorted_list(ids: torch.Tensor) -> list[int]:
+    """Public wrapper for logging and diagnostics."""
+    return _expert_ids_as_sorted_list(ids)
+
+
+def expert_set_lookahead_diff(
+    predicted_ids: torch.Tensor, actual_ids: torch.Tensor
+) -> tuple[list[int], list[int], list[int], list[int], list[int]]:
+    """Compare lookahead vs actual expert sets.
+
+    Returns:
+        predicted, actual, wrong_prefetch, missing, overlap (all sorted int lists).
+        wrong_prefetch: predicted but not needed
+        missing: needed but not predicted
+    """
+    predicted = _expert_ids_as_sorted_list(predicted_ids)
+    actual = _expert_ids_as_sorted_list(actual_ids)
+    pred_set = set(predicted)
+    act_set = set(actual)
+    wrong_prefetch = sorted(pred_set - act_set)
+    missing = sorted(act_set - pred_set)
+    overlap = sorted(pred_set & act_set)
+    return predicted, actual, wrong_prefetch, missing, overlap
+
+
 def gather_expert_rows_async(
     cpu_buffer: torch.Tensor,
     active_ids: torch.Tensor,

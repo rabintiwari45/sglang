@@ -9,7 +9,7 @@ MODEL_PATH = "Qwen/Qwen3-30B-A3B-GPTQ-Int4"
 # - mem_fraction_static: fraction of GPU for weights + KV pool (lower = less KV)
 # - max_total_tokens: hard cap on KV pool tokens (most direct knob)
 MEM_FRACTION_STATIC = 0.3
-MAX_TOTAL_TOKENS = 100  # ~9 GB KV at bf16; was ~790k (~72 GB) at 0.80
+MAX_TOTAL_TOKENS = 10000  # ~9 GB KV at bf16; was ~790k (~72 GB) at 0.80
 
 def main() -> None:
     print(f"Loading {MODEL_PATH}...")
@@ -32,7 +32,7 @@ def main() -> None:
 
     print("Model loaded successfully.")
 
-    outputs = llm.generate("Hello, how are you?", sampling_params={"max_new_tokens": 20})
+    outputs = llm.generate("Hello, how are you?", sampling_params={"max_new_tokens": 10})
     print("--------------------------------")
     print("Outputs:")
     print(outputs)

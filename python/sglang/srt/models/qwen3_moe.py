@@ -19,6 +19,7 @@
 
 import logging
 import math
+import time
 from typing import Any, Dict, Iterable, List, Optional, Tuple, TypeVar
 
 import torch
@@ -822,6 +823,12 @@ class Qwen3MoeDecoderLayer(nn.Module):
         captured_last_layer_outputs: Optional[List[torch.Tensor]] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        from sglang.srt.layers.moe.expert_vm.config import is_expert_vm_enabled
+
+        log_block_timing = is_expert_vm_enabled()
+        if log_block_timing:
+            torch.cuda.synchronize()
+            t_block = time.perf_counter()
 
         hidden_states, residual = (
             self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
@@ -834,11 +841,22 @@ class Qwen3MoeDecoderLayer(nn.Module):
         )
 
         if hidden_states.shape[0] != 0:
+            if log_block_timing:
+                torch.cuda.synchronize()
+                t_attn = time.perf_counter()
             hidden_states = self.self_attn(
                 positions=positions,
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
             )
+            if log_block_timing:
+                torch.cuda.synchronize()
+                attn_ms = (time.perf_counter() - t_attn) * 1000
+                logger.info(
+                    "[expert_vm] Attention compute layer=%d time=%.2f ms",
+                    self.layer_id,
+                    attn_ms,
+                )
 
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
@@ -864,6 +882,15 @@ class Qwen3MoeDecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.layer_communicator.postprocess_layer(
                 hidden_states, residual, forward_batch
+            )
+
+        if log_block_timing:
+            torch.cuda.synchronize()
+            block_ms = (time.perf_counter() - t_block) * 1000
+            logger.info(
+                "[expert_vm] Transformer block layer=%d time=%.2f ms",
+                self.layer_id,
+                block_ms,
             )
 
         return hidden_states, residual

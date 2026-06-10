@@ -38,9 +38,9 @@ class ExpertVMManager:
         for layer_id, layer in fused_moe_layers:
             if self.config.is_resident_layer(layer_id):
                 layer._expert_vm_offloaded = False  # type: ignore[attr-defined]
-                logger.info(
-                    "[expert_vm] Layer %d experts stay on GPU (resident).", layer_id
-                )
+                # logger.info(
+                #     "[expert_vm] Layer %d experts stay on GPU (resident).", layer_id
+                # )
                 continue
 
             self._offload_layer_experts(layer, layer_id, pin_memory)
@@ -53,13 +53,13 @@ class ExpertVMManager:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-        logger.info(
-            "[expert_vm] Offloaded %d MoE layer(s) to CPU RAM (~%.2f GiB pinned). "
-            "Resident GPU expert layers: %s",
-            len(self._offloaded_layers),
-            total_cpu_bytes / (1024**3),
-            sorted(self.config.resident_layer_ids),
-        )
+        # logger.info(
+        #     "[expert_vm] Offloaded %d MoE layer(s) to CPU RAM (~%.2f GiB pinned). "
+        #     "Resident GPU expert layers: %s",
+        #     len(self._offloaded_layers),
+        #     total_cpu_bytes / (1024**3),
+        #     sorted(self.config.resident_layer_ids),
+        # )
 
     def _offload_layer_experts(
         self, layer: FusedMoE, layer_id: int, pin_memory: bool
@@ -91,11 +91,11 @@ class ExpertVMManager:
             param.data = torch.empty(0, device=device, dtype=param.dtype)
 
         layer._expert_vm_offloaded = True  # type: ignore[attr-defined]
-        logger.debug(
-            "[expert_vm] Layer %d expert weights moved to CPU (pinned=%s).",
-            layer_id,
-            pin_memory,
-        )
+        # logger.debug(
+        #     "[expert_vm] Layer %d expert weights moved to CPU (pinned=%s).",
+        #     layer_id,
+        #     pin_memory,
+        # )
 
     def _finalize_cpu_resident_expert_params(
         self,
@@ -118,11 +118,11 @@ class ExpertVMManager:
             param.data = torch.empty(0, device=cuda_device, dtype=param.dtype)
 
         layer._expert_vm_offloaded = True  # type: ignore[attr-defined]
-        logger.debug(
-            "[expert_vm] Layer %d expert weights finalized from CPU init (pinned=%s).",
-            layer_id,
-            pin_memory,
-        )
+        # logger.debug(
+        #     "[expert_vm] Layer %d expert weights finalized from CPU init (pinned=%s).",
+        #     layer_id,
+        #     pin_memory,
+        # )
 
 
 def _copy_param_to_pinned_cpu(

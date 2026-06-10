@@ -45,18 +45,18 @@ def empty_expert_weight(
         layer_id = _layer_id(layer)
         if layer_id is not None and layer_id not in _logged_layers:
             _logged_layers.add(layer_id)
-            logger.info(
-                "[expert_vm] Layer %d expert weights will be allocated in CPU RAM.",
-                layer_id,
-            )
+            # logger.info(
+            #     "[expert_vm] Layer %d expert weights will be allocated in CPU RAM.",
+            #     layer_id,
+            # )
         return torch.empty(size, dtype=dtype, device="cpu", pin_memory=pin_memory)
 
     config = get_expert_vm_config()
     layer_id = _layer_id(layer)
     if config is not None and layer_id is not None and layer_id not in _logged_layers:
         _logged_layers.add(layer_id)
-        logger.info(
-            "[expert_vm] Layer %d expert weights will stay in GPU VRAM (resident).",
-            layer_id,
-        )
+        # logger.info(
+        #     "[expert_vm] Layer %d expert weights will stay in GPU VRAM (resident).",
+        #     layer_id,
+        # )
     return torch.empty(size, dtype=dtype)

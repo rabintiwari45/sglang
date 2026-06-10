@@ -3,6 +3,7 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/a6221a144af772fd1a68fe7e627935dc53e81738/vllm/model_executor/layers/fused_moe/layer.py
 
 import logging
+import time
 from enum import Enum
 from functools import cached_property
 from typing import List, Optional, Tuple
@@ -35,6 +36,8 @@ from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
     get_moe_runner_backend,
 )
+
+logger = logging.getLogger(__name__)
 from sglang.srt.layers.moe.kt_ep_wrapper import (
     KTEPWrapperMethod,
     create_kt_config_from_server_args,
@@ -1098,6 +1101,11 @@ class FusedMoE(torch.nn.Module):
         topk_output = expert_vm_wait_and_bind(self, topk_output)
         try:
             expert_vm_begin_lookahead_during_compute(self, hidden_states)
+            log_moe_timing = getattr(self, "_expert_vm_offloaded", False)
+            if log_moe_timing:
+                torch.cuda.synchronize()
+                t_moe = time.perf_counter()
+
             dispatch_output = self.dispatcher.dispatch(
                 hidden_states=hidden_states, topk_output=topk_output
             )
@@ -1123,6 +1131,15 @@ class FusedMoE(torch.nn.Module):
             ):
                 final_hidden_states = tensor_model_parallel_all_reduce(
                     final_hidden_states
+                )
+
+            if log_moe_timing:
+                torch.cuda.synchronize()
+                moe_ms = (time.perf_counter() - t_moe) * 1000
+                logger.info(
+                    "[expert_vm] MoE compute layer=%d time=%.2f ms",
+                    self.layer_id,
+                    moe_ms,
                 )
 
             return final_hidden_states
