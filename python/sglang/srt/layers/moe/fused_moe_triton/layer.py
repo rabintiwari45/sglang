@@ -1091,6 +1091,7 @@ class FusedMoE(torch.nn.Module):
             expert_vm_begin_lookahead_during_compute,
             expert_vm_wait_and_bind,
         )
+        from sglang.srt.layers.moe.expert_vm.config import sync_compute_stream
         from sglang.srt.layers.moe.expert_vm.manager import (
             maybe_release_expert_vm_gpu_weights,
         )
@@ -1103,7 +1104,7 @@ class FusedMoE(torch.nn.Module):
             expert_vm_begin_lookahead_during_compute(self, hidden_states)
             log_moe_timing = getattr(self, "_expert_vm_offloaded", False)
             if log_moe_timing:
-                torch.cuda.synchronize()
+                sync_compute_stream()
                 t_moe = time.perf_counter()
 
             dispatch_output = self.dispatcher.dispatch(
@@ -1134,7 +1135,7 @@ class FusedMoE(torch.nn.Module):
                 )
 
             if log_moe_timing:
-                torch.cuda.synchronize()
+                sync_compute_stream()
                 moe_ms = (time.perf_counter() - t_moe) * 1000
                 logger.info(
                     "[expert_vm] MoE compute layer=%d time=%.2f ms",

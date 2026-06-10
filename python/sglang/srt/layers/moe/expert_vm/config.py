@@ -3,7 +3,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional, Set
 
+import torch
+
 _cached_config: Optional["ExpertVMConfig"] = None
+
+
+def sync_compute_stream() -> None:
+    """Synchronize only the current compute stream, not expert-vm H2D copies."""
+    torch.cuda.current_stream().synchronize()
 
 
 def parse_resident_layer_ids(spec: str) -> Set[int]:
