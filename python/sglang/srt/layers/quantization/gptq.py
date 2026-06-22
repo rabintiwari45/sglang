@@ -1302,6 +1302,7 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
 
     def __init__(self, quant_config: GPTQMarlinConfig) -> None:
         self.quant_config = quant_config
+        self._params_dtype: Optional[torch.dtype] = None
 
     def create_weights(
         self,
@@ -1312,6 +1313,7 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
+        self._params_dtype = params_dtype
         # Delay the import to avoid circular dependency
         from sglang.srt.layers.linear import set_weight_attrs
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
@@ -1362,7 +1364,7 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
                 num_experts,
                 scales_size13,
                 2 * intermediate_size_per_partition,
-                dtype=torch.half,
+                dtype=params_dtype,
             ),
             requires_grad=False,
         )
@@ -1370,7 +1372,7 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
         set_weight_attrs(w13_scales, extra_weight_attrs)
         # down_proj scales
         w2_scales = torch.nn.Parameter(
-            torch.empty(num_experts, scales_size2, hidden_size, dtype=torch.half),
+            torch.empty(num_experts, scales_size2, hidden_size, dtype=params_dtype),
             requires_grad=False,
         )
         layer.register_parameter("w2_scales", w2_scales)
@@ -1524,6 +1526,13 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
             group_size=self.quant_config.group_size,
         )
         replace_parameter(layer, "w2_scales", marlin_w2_scales)
+
+        # Checkpoint scales are often float16; Marlin requires scales dtype ==
+        # activation dtype (e.g. bfloat16 when dtype="bfloat16").
+        act_dtype = self._params_dtype
+        if act_dtype is not None and layer.w13_scales.dtype != act_dtype:
+            replace_parameter(layer, "w13_scales", layer.w13_scales.to(act_dtype))
+            replace_parameter(layer, "w2_scales", layer.w2_scales.to(act_dtype))
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig

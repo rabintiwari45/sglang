@@ -1091,9 +1091,12 @@ class FusedMoE(torch.nn.Module):
             hidden_states=hidden_states, topk_output=topk_output
         )
 
-        combine_input = self.run_moe_core(
-            dispatch_output=dispatch_output,
-        )
+        from sglang.srt.utils.layer_timing import step as layer_timing_step
+
+        with layer_timing_step("moe_compute"):
+            combine_input = self.run_moe_core(
+                dispatch_output=dispatch_output,
+            )
 
         with use_symmetric_memory(
             get_tp_group(), disabled=not is_allocation_symmetric()
