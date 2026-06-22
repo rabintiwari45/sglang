@@ -20,15 +20,20 @@ def get_active_expert_ids(topk_ids: torch.Tensor) -> Tuple[torch.Tensor, int]:
 
 
 def remap_topk_ids(
-    topk_ids: torch.Tensor, active_ids: torch.Tensor
+    topk_ids: torch.Tensor,
+    active_ids: torch.Tensor,
+    num_experts: int,
 ) -> torch.Tensor:
-    """Map global expert ids to compact indices 0..K-1."""
+    """Map global expert ids to compact indices 0..K-1.
+
+    `num_experts` is the static expert count for the layer; using it to size
+    the lookup table avoids a `active_ids.max().item()` call, which would force
+    a CPU<->GPU sync on the hot path every layer.
+    """
     if active_ids.numel() == 0:
         return topk_ids.clone()
-    # active_ids sorted from unique
-    max_id = int(active_ids.max().item()) if active_ids.numel() else 0
     lookup = torch.full(
-        (max_id + 1,), -1, dtype=torch.int32, device=topk_ids.device
+        (num_experts,), -1, dtype=torch.int32, device=topk_ids.device
     )
     lookup[active_ids.to(torch.int64)] = torch.arange(
         active_ids.numel(), dtype=torch.int32, device=topk_ids.device
@@ -40,14 +45,19 @@ def remap_topk_ids(
 def expert_sets_match(
     active_a: torch.Tensor, active_b: torch.Tensor
 ) -> bool:
+    """Compare two expert-id tensors without a GPU sync.
+
+    Converts both tensors to sorted Python sets on CPU.  The tensors are
+    tiny (≤8 int64s each) so the D2H transfer is negligible, and it avoids
+    the torch.equal GPU sync that previously stalled the router step.
+    """
     if active_a.numel() != active_b.numel():
         return False
     if active_a.numel() == 0:
         return True
-    return torch.equal(
-        torch.sort(active_a)[0].to(torch.int64),
-        torch.sort(active_b)[0].to(torch.int64),
-    )
+    a = set(active_a.to(dtype=torch.int64, device="cpu").tolist())
+    b = set(active_b.to(dtype=torch.int64, device="cpu").tolist())
+    return a == b
 
 
 def _expert_ids_as_sorted_list(ids: torch.Tensor) -> list[int]:
@@ -83,17 +93,23 @@ def expert_set_lookahead_diff(
 
 def gather_expert_rows_async(
     cpu_buffer: torch.Tensor,
-    active_ids: torch.Tensor,
+    ids_list: list,
     dst: torch.Tensor,
     copy_stream: torch.cuda.Stream,
 ) -> None:
-    """Copy selected expert rows from pinned CPU buffer to GPU tensor on copy_stream."""
+    """Copy selected expert rows from pinned CPU buffer to GPU tensor on copy_stream.
+
+    Uses row-by-row views into the pinned cpu_buffer so each transfer is a
+    true non-blocking DMA directly from pinned memory.  The previous approach
+    called index_select() which produced a new **non-pinned** tensor; PyTorch
+    then fell back to a synchronous staging copy (non-pinned → pinned →
+    GPU), blocking the CPU thread for the entire ~8 ms copy duration and
+    serialising the MoE compute that should have overlapped it.
+    """
     with torch.cuda.stream(copy_stream):
-        if active_ids.device.type != "cpu":
-            ids_cpu = active_ids.to(dtype=torch.int64, device="cpu")
-        else:
-            ids_cpu = active_ids.to(dtype=torch.int64)
-        dst.copy_(cpu_buffer.index_select(0, ids_cpu), non_blocking=True)
+        for i, eid in enumerate(ids_list):
+            # cpu_buffer[eid] is a view into pinned memory → true async DMA
+            dst[i].copy_(cpu_buffer[eid], non_blocking=True)
 
 
 def allocate_compact_gpu_tensors(

@@ -86,6 +86,10 @@ class ExpertVMManager:
 
         for name in param_names:
             param = getattr(layer, name)
+            # Store in PINNED CPU RAM so the prefetch can DMA selected expert rows
+            # directly to the GPU (non_blocking) without a CPU-side index_select
+            # gather.  A pageable buffer would silently force every non_blocking
+            # copy to run synchronously (~200 ms/token of CPU stall across layers).
             cpu_tensor = _copy_param_to_pinned_cpu(param, pin_memory)
             layer.register_buffer(f"expert_vm_{name}_cpu", cpu_tensor, persistent=False)
             param.data = torch.empty(0, device=device, dtype=param.dtype)
@@ -136,6 +140,21 @@ def _copy_param_to_pinned_cpu(
         layout=src.layout,
         device="cpu",
         pin_memory=pin_memory,
+    )
+    cpu_data.copy_(src)
+    return cpu_data
+
+
+def _copy_param_to_cpu(param: torch.nn.Parameter) -> torch.Tensor:
+    """Copy to regular (non-pinned) CPU RAM for fast CPU-side reads."""
+    src = param.data.detach()
+    cpu_data = torch.empty_strided(
+        size=src.size(),
+        stride=src.stride(),
+        dtype=src.dtype,
+        layout=src.layout,
+        device="cpu",
+        pin_memory=False,
     )
     cpu_data.copy_(src)
     return cpu_data

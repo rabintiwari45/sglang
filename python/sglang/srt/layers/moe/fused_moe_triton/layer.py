@@ -1088,10 +1088,8 @@ class FusedMoE(torch.nn.Module):
 
     def forward_impl(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
         from sglang.srt.layers.moe.expert_vm.prefetch import (
-            expert_vm_begin_lookahead_during_compute,
             expert_vm_wait_and_bind,
         )
-        from sglang.srt.layers.moe.expert_vm.config import sync_compute_stream
         from sglang.srt.layers.moe.expert_vm.manager import (
             maybe_release_expert_vm_gpu_weights,
         )
@@ -1101,12 +1099,6 @@ class FusedMoE(torch.nn.Module):
 
         topk_output = expert_vm_wait_and_bind(self, topk_output)
         try:
-            expert_vm_begin_lookahead_during_compute(self, hidden_states)
-            log_moe_timing = getattr(self, "_expert_vm_offloaded", False)
-            if log_moe_timing:
-                sync_compute_stream()
-                t_moe = time.perf_counter()
-
             dispatch_output = self.dispatcher.dispatch(
                 hidden_states=hidden_states, topk_output=topk_output
             )
@@ -1132,15 +1124,6 @@ class FusedMoE(torch.nn.Module):
             ):
                 final_hidden_states = tensor_model_parallel_all_reduce(
                     final_hidden_states
-                )
-
-            if log_moe_timing:
-                sync_compute_stream()
-                moe_ms = (time.perf_counter() - t_moe) * 1000
-                logger.info(
-                    "[expert_vm] MoE compute layer=%d time=%.2f ms",
-                    self.layer_id,
-                    moe_ms,
                 )
 
             return final_hidden_states

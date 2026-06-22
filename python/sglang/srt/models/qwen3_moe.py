@@ -18,8 +18,8 @@
 """Inference-only Qwen3MoE model compatible with HuggingFace weights."""
 
 import logging
-import math
 import time
+import math
 from typing import Any, Dict, Iterable, List, Optional, Tuple, TypeVar
 
 import torch
@@ -89,6 +89,8 @@ from sglang.srt.utils import (
     is_npu,
 )
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
+from sglang.srt.utils.layer_timing import layer as layer_timing_layer
+from sglang.srt.utils.layer_timing import step as layer_timing_step
 
 _is_cuda = is_cuda()
 
@@ -327,45 +329,46 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
-        offloaded = getattr(self.experts, "_expert_vm_offloaded", False)
-        if offloaded:
-            from sglang.srt.layers.moe.expert_vm.config import sync_compute_stream
-            from sglang.srt.layers.moe.expert_vm.prefetch import expert_vm_begin_prefetch
+        with layer_timing_step("router"):
+            # router_logits: (num_tokens, n_experts)
+            router_logits, _ = self.gate(hidden_states)
+            topk_output = self.topk(hidden_states, router_logits)
+            if getattr(self.experts, "_expert_vm_offloaded", False):
+                from sglang.srt.layers.moe.expert_vm.prefetch import (
+                    expert_vm_begin_prefetch,
+                )
 
-            sync_compute_stream()
-            t_router = time.perf_counter()
+                expert_vm_begin_prefetch(self.experts, topk_output)
 
-        # router_logits: (num_tokens, n_experts)
-        router_logits, _ = self.gate(hidden_states)
-        topk_output = self.topk(hidden_states, router_logits)
-
-        if offloaded:
-            expert_vm_begin_prefetch(self.experts, topk_output)
-            sync_compute_stream()
-            router_ms = (time.perf_counter() - t_router) * 1000
-            logger.info(
-                "[expert_vm] MoE router layer=%d time=%.2f ms",
-                self.layer_id,
-                router_ms,
+        # Start next-layer lookahead outside router/moe timing so gate+topk and
+        # CPU gather do not inflate router or block MoE dispatch on the CPU.
+        if getattr(self.experts, "_expert_vm_offloaded", False):
+            from sglang.srt.layers.moe.expert_vm.prefetch import (
+                expert_vm_begin_lookahead,
             )
 
-        final_hidden_states = self.experts(hidden_states, topk_output)
+            expert_vm_begin_lookahead(self.experts, hidden_states)
 
-        if self.ep_size > 1 and not should_skip_post_experts_all_reduce(
-            is_tp_path=False,
-            use_reduce_scatter=use_reduce_scatter,
-            should_allreduce_fusion=should_allreduce_fusion,
-        ):
-            final_hidden_states = moe_expert_parallel_all_reduce(final_hidden_states)
+        with layer_timing_step("moe"):
+            final_hidden_states = self.experts(hidden_states, topk_output)
 
-        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
-            is_tp_path=True,
-            use_reduce_scatter=use_reduce_scatter,
-            should_allreduce_fusion=should_allreduce_fusion,
-        ):
-            final_hidden_states = moe_tensor_model_parallel_all_reduce(
-                final_hidden_states
-            )
+            if self.ep_size > 1 and not should_skip_post_experts_all_reduce(
+                is_tp_path=False,
+                use_reduce_scatter=use_reduce_scatter,
+                should_allreduce_fusion=should_allreduce_fusion,
+            ):
+                final_hidden_states = moe_expert_parallel_all_reduce(
+                    final_hidden_states
+                )
+
+            if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
+                is_tp_path=True,
+                use_reduce_scatter=use_reduce_scatter,
+                should_allreduce_fusion=should_allreduce_fusion,
+            ):
+                final_hidden_states = moe_tensor_model_parallel_all_reduce(
+                    final_hidden_states
+                )
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 
@@ -373,22 +376,25 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ) -> torch.Tensor:
         if hidden_states.shape[0] > 0:
-            # router_logits: (num_tokens, n_experts)
-            router_logits, _ = self.gate(hidden_states)
-            topk_output = self.topk(
-                hidden_states,
-                router_logits,
-                num_token_non_padded=forward_batch.num_token_non_padded,
-                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                    layer_id=self.layer_id,
-                ),
-            )
+            with layer_timing_step("router"):
+                # router_logits: (num_tokens, n_experts)
+                router_logits, _ = self.gate(hidden_states)
+                topk_output = self.topk(
+                    hidden_states,
+                    router_logits,
+                    num_token_non_padded=forward_batch.num_token_non_padded,
+                    expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
+                        layer_id=self.layer_id,
+                    ),
+                )
         else:
             topk_output = self.topk.empty_topk_output(hidden_states.device)
-        final_hidden_states = self.experts(
-            hidden_states=hidden_states,
-            topk_output=topk_output,
-        )
+
+        with layer_timing_step("moe"):
+            final_hidden_states = self.experts(
+                hidden_states=hidden_states,
+                topk_output=topk_output,
+            )
         return final_hidden_states
 
     def op_gate(self, state):
@@ -836,98 +842,65 @@ class Qwen3MoeDecoderLayer(nn.Module):
         captured_last_layer_outputs: Optional[List[torch.Tensor]] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        from sglang.srt.layers.moe.expert_vm.config import (
-            is_expert_vm_enabled,
-            sync_compute_stream,
-        )
-
-        log_block_timing = is_expert_vm_enabled()
-        if log_block_timing:
-            sync_compute_stream()
-            t_block = time.perf_counter()
-
-        hidden_states, residual = (
-            self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
-                hidden_states,
-                residual,
-                forward_batch,
-                captured_last_layer_outputs=captured_last_layer_outputs,
-                **kwargs,
-            )
-        )
-        if log_block_timing:
-            t_after_prep_attn = time.perf_counter()
-
-        if hidden_states.shape[0] != 0:
-            if log_block_timing:
-                sync_compute_stream()
-                t_attn = time.perf_counter()
-            hidden_states = self.self_attn(
-                positions=positions,
-                hidden_states=hidden_states,
-                forward_batch=forward_batch,
-            )
-            if log_block_timing:
-                sync_compute_stream()
-                attn_ms = (time.perf_counter() - t_attn) * 1000
-                logger.info(
-                    "[expert_vm] Attention compute layer=%d time=%.2f ms",
-                    self.layer_id,
-                    attn_ms,
+        with layer_timing_layer(self.layer_id):
+            with layer_timing_step("input_norm"):
+                hidden_states, residual = (
+                    self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
+                        hidden_states,
+                        residual,
+                        forward_batch,
+                        captured_last_layer_outputs=captured_last_layer_outputs,
+                        **kwargs,
+                    )
                 )
 
-        if log_block_timing:
-            t_after_attn = time.perf_counter()
+            if hidden_states.shape[0] != 0:
+                with layer_timing_step("attn"):
+                    hidden_states = self.self_attn(
+                        positions=positions,
+                        hidden_states=hidden_states,
+                        forward_batch=forward_batch,
+                    )
 
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
-            hidden_states, residual, forward_batch
-        )
-        if log_block_timing:
-            t_after_prep_mlp = time.perf_counter()
+            with layer_timing_step("post_attn_norm"):
+                hidden_states, residual = self.layer_communicator.prepare_mlp(
+                    hidden_states, residual, forward_batch
+                )
 
-        should_allreduce_fusion = (
-            self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
+            should_allreduce_fusion = (
+                self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
+                    forward_batch
+                )
+            )
+
+            # For DP with padding, reduce scatter can be used instead of all-reduce.
+            use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
                 forward_batch
             )
-        )
 
-        # For DP with padding, reduce scatter can be used instead of all-reduce.
-        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
-            forward_batch
-        )
+            if self.is_layer_sparse:
+                hidden_states = self.mlp(
+                    hidden_states,
+                    forward_batch,
+                    should_allreduce_fusion,
+                    use_reduce_scatter,
+                )
+            else:
+                with layer_timing_step("mlp"):
+                    hidden_states = self.mlp(
+                        hidden_states,
+                        forward_batch,
+                        should_allreduce_fusion,
+                        use_reduce_scatter,
+                    )
 
-        hidden_states = self.mlp(
-            hidden_states, forward_batch, should_allreduce_fusion, use_reduce_scatter
-        )
-        if log_block_timing:
-            t_after_mlp = time.perf_counter()
-
-        if should_allreduce_fusion:
-            hidden_states._sglang_needs_allreduce_fusion = True
-        else:
-            hidden_states, residual = self.layer_communicator.postprocess_layer(
-                hidden_states, residual, forward_batch
-            )
-        if log_block_timing:
-            t_after_post = time.perf_counter()
-
-        if log_block_timing:
-            sync_compute_stream()
-            block_ms = (time.perf_counter() - t_block) * 1000
-            prep_attn_ms = (t_after_prep_attn - t_block) * 1000
-            prep_mlp_ms = (t_after_prep_mlp - t_after_attn) * 1000
-            mlp_ms = (t_after_mlp - t_after_prep_mlp) * 1000
-            post_ms = (t_after_post - t_after_mlp) * 1000
-            logger.info(
-                "[expert_vm] Transformer block layer=%d time=%.2f ms "
-                "(prep_attn=%.2f prep_mlp=%.2f mlp=%.2f post=%.2f)",
-                self.layer_id,
-                block_ms,
-                prep_attn_ms,
-                prep_mlp_ms,
-                mlp_ms,
-                post_ms,
-            )
+            if should_allreduce_fusion:
+                hidden_states._sglang_needs_allreduce_fusion = True
+            else:
+                with layer_timing_step("post"):
+                    hidden_states, residual = self.layer_communicator.postprocess_layer(
+                        hidden_states, residual, forward_batch
+                    )
 
         return hidden_states, residual
 

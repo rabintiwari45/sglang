@@ -1,18 +1,14 @@
 from __future__ import annotations
 
 import logging
-import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Dict, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional
 
 import torch
 
 from sglang.srt.layers.moe.expert_vm.config import get_expert_vm_config
 from sglang.srt.layers.moe.expert_vm.gather import (
     allocate_compact_gpu_tensors,
-    expert_ids_as_sorted_list,
-    expert_set_lookahead_diff,
-    expert_sets_match,
     gather_expert_rows_async,
     get_active_expert_ids,
     remap_topk_ids,
@@ -35,9 +31,11 @@ class _PrefetchJob:
     copy_start_event: torch.cuda.Event
     copy_end_event: torch.cuda.Event
     bytes_transferred: int
+    # topk_output to bind for this layer's MoE compute.  Always matches the
+    # expert rows actually staged into VRAM (predicted for lookahead jobs,
+    # actual for cold-start jobs), so dispatch never references an unloaded expert.
+    bind_topk: Optional[StandardTopKOutput] = None
     is_lookahead: bool = False
-    lookahead_topk: Optional[StandardTopKOutput] = None
-    use_predicted_topk: bool = False
 
 
 @dataclass
@@ -57,8 +55,6 @@ class ExpertVMPrefetchCoordinator:
         self._copy_stream: Optional[torch.cuda.Stream] = None
         self._stats_prefetches: int = 0
         self._stats_lookaheads: int = 0
-        self._stats_lookahead_hits: int = 0
-        self._stats_lookahead_misses: int = 0
 
     def register_sparse_block(self, block: "Qwen3MoeSparseMoeBlock") -> None:
         layer_id = block.layer_id
@@ -88,79 +84,29 @@ class ExpertVMPrefetchCoordinator:
             return topk_output
         return topk_output.to_standard(layer_id=layer_id)
 
-    def begin_prefetch(
+    def _gather_and_submit_dma(
         self,
         layer: FusedMoE,
-        topk_output: TopKOutput,
-        *,
-        is_lookahead: bool = False,
+        layer_id: int,
+        param_names: List[str],
+        active_ids: torch.Tensor,
+        k: int,
+        gpu_tensors: Dict[str, torch.Tensor],
+        copy_stream: torch.cuda.Stream,
+        copy_start: torch.cuda.Event,
+        copy_end: torch.cuda.Event,
+        job: _PrefetchJob,
     ) -> None:
-        if not self._should_stage(layer):
-            return
+        # Single tiny D2H to learn which expert rows to copy.
+        if active_ids.device.type != "cpu":
+            ids_list = active_ids.to(dtype=torch.int64, device="cpu").tolist()
+        else:
+            ids_list = active_ids.to(dtype=torch.int64).tolist()
 
-        layer_id = layer.layer_id
-        std_topk = self._normalize_topk(topk_output, layer_id)
-        active_ids, k = get_active_expert_ids(std_topk.topk_ids)
-        runtime = self._layers[layer_id]
-
-        # If a lookahead is already pending for this layer with the same expert
-        # set, reuse it — avoid a redundant H2D copy when forward_normal fires
-        # its own begin_prefetch right after the lookahead transfer has already
-        # started on the copy stream.
-        existing = runtime.pending_job
-        if existing is not None and existing.is_lookahead and not is_lookahead:
-            predicted, actual, wrong_prefetch, missing, overlap = (
-                expert_set_lookahead_diff(existing.active_ids, active_ids)
-            )
-            if expert_sets_match(active_ids, existing.active_ids):
-                existing.is_lookahead = False  # promote to confirmed prefetch
-                self._stats_prefetches += 1
-                self._stats_lookahead_hits += 1
-                logger.info(
-                    "[expert_vm] Lookahead hit layer=%d | predicted=%s actual=%s",
-                    layer_id,
-                    predicted,
-                    actual,
-                )
-                return
-
-            # Miss: keep predicted weights; route with predicted topk so compact
-            # indices stay in range (actual topk would remap to -1 and crash MoE).
-            self._stats_lookahead_misses += 1
-            logger.info(
-                "[expert_vm] Lookahead miss layer=%d | "
-                "predicted=%s actual=%s | "
-                "wrong_prefetch=%s missing=%s overlap=%s | "
-                "using predicted topk for compute",
-                layer_id,
-                predicted,
-                actual,
-                wrong_prefetch,
-                missing,
-                overlap,
-            )
-            existing.is_lookahead = False
-            existing.use_predicted_topk = True
-            return
-
-        if not is_lookahead and (existing is None or not existing.is_lookahead):
-            logger.info(
-                "[expert_vm] Prefetch actual layer=%d experts=%s (no prior lookahead)",
-                layer_id,
-                expert_ids_as_sorted_list(active_ids),
-            )
-
-        param_names = get_expert_vm_param_names(layer)
-        device = torch.device("cuda", torch.cuda.current_device())
-
-        gpu_tensors = allocate_compact_gpu_tensors(
-            layer, param_names, active_ids, device
-        )
+        # Direct row-by-row DMA from PINNED cpu_buf -> compact GPU tensor.
+        # No CPU index_select gather: the copy engine reads pinned host rows
+        # directly and the copies are truly non-blocking, overlapping compute.
         bytes_xferred = 0
-        copy_stream = self._get_copy_stream()
-        copy_start = torch.cuda.Event(enable_timing=True)
-        copy_end = torch.cuda.Event(enable_timing=True)
-
         with torch.cuda.stream(copy_stream):
             copy_start.record(copy_stream)
             for name in param_names:
@@ -168,46 +114,76 @@ class ExpertVMPrefetchCoordinator:
                 gpu_t = gpu_tensors.get(name)
                 if cpu_buf is None or gpu_t is None:
                     continue
-                gather_expert_rows_async(cpu_buf, active_ids, gpu_t, copy_stream)
+                gather_expert_rows_async(cpu_buf, ids_list, gpu_t, copy_stream)
                 bytes_xferred += gpu_t.numel() * gpu_t.element_size()
             copy_end.record(copy_stream)
 
+        job.bytes_transferred = bytes_xferred
+
+    def begin_prefetch(
+        self,
+        layer: FusedMoE,
+        topk_output: TopKOutput,
+    ) -> None:
+        """Prefetch layer L's experts synchronously on the main thread.
+
+        If a lookahead job already exists (pre-fetched by the previous layer's
+        begin_lookahead), this is a no-op — wait_and_bind handles the hit/miss check.
+
+        Cold-start (first layer, no prior lookahead): gather + DMA run here, then
+        wait_and_bind uses wait_event (GPU-side) so CPU returns immediately.
+        """
+        if not self._should_stage(layer):
+            return
+
+        layer_id = layer.layer_id
+        runtime = self._layers[layer_id]
+
+        if runtime.pending_job is not None:
+            return  # lookahead already submitted this layer's DMA
+
+        # Cold-start: compute active experts and submit DMA synchronously.
+        std_topk = self._normalize_topk(topk_output, layer_id)
+        active_ids, k = get_active_expert_ids(std_topk.topk_ids)
+        param_names = get_expert_vm_param_names(layer)
+        device = torch.device("cuda", torch.cuda.current_device())
+        copy_stream = self._get_copy_stream()
+        copy_start = torch.cuda.Event(enable_timing=False)
+        copy_end = torch.cuda.Event(enable_timing=False)
+
+        gpu_tensors = allocate_compact_gpu_tensors(layer, param_names, active_ids, device)
         job = _PrefetchJob(
             layer_id=layer_id,
             active_ids=active_ids,
             gpu_tensors=gpu_tensors,
             copy_start_event=copy_start,
             copy_end_event=copy_end,
-            bytes_transferred=bytes_xferred,
-            is_lookahead=is_lookahead,
-            lookahead_topk=std_topk if is_lookahead else None,
+            bytes_transferred=0,
+            bind_topk=std_topk,  # cold start: actual topk is exact
+            is_lookahead=False,
         )
         runtime.pending_job = job
-
-        if is_lookahead:
-            logger.info(
-                "[expert_vm] Lookahead predicted layer=%d experts=%s",
-                layer_id,
-                expert_ids_as_sorted_list(active_ids),
-            )
-
-        # kind = "lookahead" if is_lookahead else "prefetch"
-        # logger.info(
-        #     "[expert_vm] %s started layer=%d active_experts=%d bytes=%.2f MiB",
-        #     kind,
-        #     layer_id,
-        #     k,
-        #     bytes_xferred / (1024**2),
-        # )
-        self._stats_prefetches += 0 if is_lookahead else 1
-        self._stats_lookaheads += 1 if is_lookahead else 0
+        self._gather_and_submit_dma(
+            layer, layer_id, param_names, active_ids, k,
+            gpu_tensors, copy_stream, copy_start, copy_end, job,
+        )
+        self._stats_prefetches += 1
 
     def begin_lookahead_prefetch_during_compute(
         self,
         current_layer: FusedMoE,
         hidden_states: torch.Tensor,
     ) -> None:
-        """While layer L experts compute, speculatively prefetch layer L+1 top-k experts."""
+        """Predict and prefetch layer L+1's experts (called between L's router and moe).
+
+        Cross-layer prediction: gate+topk for L+1 is computed from layer L's hidden
+        states, then those expert rows are copied CPU->GPU on the copy_stream.
+
+        The only CPU<->GPU sync here is a single tiny D2H of the predicted expert ids
+        (needed to index the CPU-resident weight buffers).  The DMA itself is issued
+        non-blocking and overlaps layer L's MoE compute; layer L+1's wait_and_bind
+        later does a GPU-side wait_event with no CPU stall.
+        """
         if not self._should_stage(current_layer):
             return
 
@@ -218,18 +194,46 @@ class ExpertVMPrefetchCoordinator:
         if not getattr(next_block.experts, "_expert_vm_offloaded", False):
             return
 
+        next_runtime = self._layers[next_id]
+        if next_runtime.pending_job is not None:
+            return  # already have a job for next layer
+
+        layer = next_block.experts
+        param_names = get_expert_vm_param_names(layer)
+        copy_stream = self._get_copy_stream()
+        device = torch.device("cuda", torch.cuda.current_device())
+
+        copy_start = torch.cuda.Event(enable_timing=False)
+        copy_end = torch.cuda.Event(enable_timing=False)
+
+        # Predict L+1's experts from L's hidden states (cross-layer gate prediction).
         with torch.no_grad():
             router_logits, _ = next_block.gate(hidden_states)
             topk_output = next_block.topk(hidden_states, router_logits)
 
-        # logger.info(
-        #     "[expert_vm] Lookahead gate+topk for layer=%d during layer=%d expert compute",
-        #     next_id,
-        #     current_layer.layer_id,
-        # )
-        self.begin_prefetch(
-            next_block.experts, topk_output, is_lookahead=True
+        std_topk = self._normalize_topk(topk_output, next_id)
+        active_ids, k = get_active_expert_ids(std_topk.topk_ids)
+
+        gpu_tensors = allocate_compact_gpu_tensors(layer, param_names, active_ids, device)
+
+        job = _PrefetchJob(
+            layer_id=next_id,
+            active_ids=active_ids,
+            gpu_tensors=gpu_tensors,
+            copy_start_event=copy_start,
+            copy_end_event=copy_end,
+            bytes_transferred=0,
+            bind_topk=std_topk,  # compute L+1 with the experts we staged
+            is_lookahead=True,
         )
+        next_runtime.pending_job = job
+
+        # Gather + DMA (single D2H of ids inside; copy is async on copy_stream).
+        self._gather_and_submit_dma(
+            layer, next_id, param_names, active_ids, k,
+            gpu_tensors, copy_stream, copy_start, copy_end, job,
+        )
+        self._stats_lookaheads += 1
 
     def wait_and_bind(
         self, layer: FusedMoE, topk_output: TopKOutput
@@ -238,31 +242,26 @@ class ExpertVMPrefetchCoordinator:
             return topk_output
 
         layer_id = layer.layer_id
-        std_topk = self._normalize_topk(topk_output, layer_id)
-        active_ids, k = get_active_expert_ids(std_topk.topk_ids)
         runtime = self._layers[layer_id]
 
         job = runtime.pending_job
         if job is None:
-            # No lookahead from prior layer (e.g. layer 1 after resident layer 0).
-            self.begin_prefetch(layer, std_topk, is_lookahead=False)
+            # Cold start (e.g. first offloaded layer): synchronous prefetch.
+            std_topk = self._normalize_topk(topk_output, layer_id)
+            self.begin_prefetch(layer, std_topk)
             job = runtime.pending_job
 
-        assert job is not None
-        t0 = time.perf_counter()
-        job.copy_end_event.synchronize()
-        wait_ms = (time.perf_counter() - t0) * 1000
-        if job.bytes_transferred > 0:
-            copy_ms = job.copy_start_event.elapsed_time(job.copy_end_event)
-        else:
-            copy_ms = 0.0
+        assert job is not None and job.bind_topk is not None
 
-        if job.use_predicted_topk and job.lookahead_topk is not None:
-            bind_topk = job.lookahead_topk
-        else:
-            bind_topk = std_topk
+        # GPU-side dependency only: the compute stream waits for the H2D copy to
+        # finish before dispatch/GEMM.  The CPU returns immediately — no stall, and
+        # no D2H readback (we always bind the topk matching the staged experts).
+        torch.cuda.current_stream().wait_event(job.copy_end_event)
 
-        remapped_ids = remap_topk_ids(bind_topk.topk_ids, job.active_ids)
+        bind_topk = job.bind_topk
+        remapped_ids = remap_topk_ids(
+            bind_topk.topk_ids, job.active_ids, layer.num_experts
+        )
         remapped_topk = StandardTopKOutput(
             bind_topk.topk_weights, remapped_ids, bind_topk.router_logits
         )
@@ -278,17 +277,6 @@ class ExpertVMPrefetchCoordinator:
         runtime.bound_job = job
         runtime.pending_job = None
         runtime.remapped_topk = remapped_topk
-
-        num_staged = int(job.active_ids.numel())
-        logger.info(
-            "[expert_vm] Expert fetch layer=%d active_experts=%d "
-            "copy=%.2f ms wait=%.2f ms bytes=%.2f MiB",
-            layer_id,
-            num_staged,
-            copy_ms,
-            wait_ms,
-            job.bytes_transferred / (1024**2),
-        )
         return remapped_topk
 
     def release(self, layer: FusedMoE) -> None:
@@ -308,10 +296,6 @@ class ExpertVMPrefetchCoordinator:
             param = getattr(layer, name)
             param.data = torch.empty(0, device=device, dtype=param.dtype)
 
-        # logger.info(
-        #     "[expert_vm] Released GPU expert staging for layer=%d",
-        #     layer_id,
-        # )
         runtime.bound_job = None
         runtime.remapped_topk = None
 
@@ -353,6 +337,10 @@ def expert_vm_begin_lookahead_during_compute(
     get_expert_vm_coordinator().begin_lookahead_prefetch_during_compute(
         layer, hidden_states
     )
+
+
+# Public alias used by qwen3_moe.py between router and moe steps.
+expert_vm_begin_lookahead = expert_vm_begin_lookahead_during_compute
 
 
 def expert_vm_wait_and_bind(
