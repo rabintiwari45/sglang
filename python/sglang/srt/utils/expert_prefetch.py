@@ -39,6 +39,8 @@ from typing import Dict, List, Optional, Set
 
 import torch
 
+from sglang.srt.utils.layer_timing import step as layer_timing_step
+
 logger = logging.getLogger(__name__)
 
 # Per-expert parameters are auto-detected (first dim == num_experts and
@@ -244,30 +246,38 @@ class ExpertPrefetcher:
         """
         # Empty batches (e.g. padding-only): fall back to the plain router path.
         if hidden_states is None or hidden_states.shape[0] == 0:
-            router_logits, _ = gate(hidden_states)
-            return topk(hidden_states, router_logits)
+            with layer_timing_step("router_gate"):
+                router_logits, _ = gate(hidden_states)
+            with layer_timing_step("router_topk"):
+                return topk(hidden_states, router_logits)
 
         self.maybe_init(hidden_states.device)
 
         if not self._offloaded_layers:
-            router_logits, _ = gate(hidden_states)
-            return topk(hidden_states, router_logits)
+            with layer_timing_step("router_gate"):
+                router_logits, _ = gate(hidden_states)
+            with layer_timing_step("router_topk"):
+                return topk(hidden_states, router_logits)
 
         if layer_id in self._predicted_topk:
             # Predicted-routing path: use the routing decided one layer earlier
             # and bind the experts to the buffer that holds those experts.
             topk_output = self._predicted_topk.pop(layer_id)
-            self._bind_resident(layer_id)
+            with layer_timing_step("router_bind"):
+                self._bind_resident(layer_id)
             self.stat_layers += 1
         else:
             # Resident/first layer or cold start: use the real router.
-            router_logits, _ = gate(hidden_states)
-            topk_output = topk(hidden_states, router_logits)
+            with layer_timing_step("router_gate"):
+                router_logits, _ = gate(hidden_states)
+            with layer_timing_step("router_topk"):
+                topk_output = topk(hidden_states, router_logits)
             if layer_id in self._cpu_store:
                 # Cold start safety (e.g. a non-resident first layer): the
                 # experts were never prefetched, so load the routed ones now.
                 self.stat_cold += 1
-                self._cold_load(layer_id, topk_output.topk_ids)
+                with layer_timing_step("router_cold_load"):
+                    self._cold_load(layer_id, topk_output.topk_ids)
 
         # Kick off the predicted prefetch for the next sparse layer; this runs
         # on the side stream and overlaps with this layer's expert compute.
@@ -321,8 +331,10 @@ class ExpertPrefetcher:
         gate = self._get_gate(self.layers[layer_id])
         topk = self._get_topk(self.layers[layer_id])
         with torch.no_grad():
-            router_logits, _ = gate(hidden_states)
-            topk_output = topk(hidden_states, router_logits)
+            with layer_timing_step("router_predict_gate"):
+                router_logits, _ = gate(hidden_states)
+            with layer_timing_step("router_predict_topk"):
+                topk_output = topk(hidden_states, router_logits)
         predicted_ids = [
             e
             for e in torch.unique(topk_output.topk_ids).tolist()
@@ -339,15 +351,16 @@ class ExpertPrefetcher:
 
         # Make the side stream wait for all prior default-stream work so we
         # never overwrite a buffer that the previous layer is still reading.
-        self._side_stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(self._side_stream):
-            for name in self._param_names:
-                dst = buf[name]
-                src = store[name]
-                for e in predicted_ids:
-                    dst[e].copy_(src[e], non_blocking=True)
-            event = torch.cuda.Event()
-            event.record(self._side_stream)
+        with layer_timing_step("router_predict_launch"):
+            self._side_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(self._side_stream):
+                for name in self._param_names:
+                    dst = buf[name]
+                    src = store[name]
+                    for e in predicted_ids:
+                        dst[e].copy_(src[e], non_blocking=True)
+                event = torch.cuda.Event()
+                event.record(self._side_stream)
         self._events[layer_id] = event
 
     def log_stats(self) -> None:

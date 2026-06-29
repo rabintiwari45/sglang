@@ -5,6 +5,9 @@ Enable with ``SGLANG_LOG_LAYER_TIMING=1``.
 Logs one summary line per forward pass (prefill or decode) with aggregated:
   attn, router, moe, moe_compute, total
 
+When router sub-steps are recorded, the summary also breaks ``router`` down into:
+  gate, topk, bind, cold_load, predict_gate, predict_topk, predict_launch
+
 Per-layer detail is optional via ``SGLANG_LOG_LAYER_TIMING_DETAIL=1``.
 """
 
@@ -34,6 +37,13 @@ STEP_ORDER: List[str] = [
     "attn",
     "post_attn_norm",
     "router",
+    "router_gate",
+    "router_topk",
+    "router_bind",
+    "router_cold_load",
+    "router_predict_gate",
+    "router_predict_topk",
+    "router_predict_launch",
     "moe",
     "moe_compute",
     "mlp",
@@ -41,6 +51,26 @@ STEP_ORDER: List[str] = [
 ]
 
 _SUMMARY_STEPS = frozenset({"attn", "router", "moe", "moe_compute"})
+
+# Sub-steps that roll up into the top-level ``router`` bucket in the summary.
+_ROUTER_SUBSTEPS: List[str] = [
+    "router_gate",
+    "router_topk",
+    "router_bind",
+    "router_cold_load",
+    "router_predict_gate",
+    "router_predict_topk",
+    "router_predict_launch",
+]
+_ROUTER_SUBSTEP_LABELS = {
+    "router_gate": "gate",
+    "router_topk": "topk",
+    "router_bind": "bind",
+    "router_cold_load": "cold_load",
+    "router_predict_gate": "predict_gate",
+    "router_predict_topk": "predict_topk",
+    "router_predict_launch": "predict_launch",
+}
 
 
 def is_layer_timing_enabled() -> bool:
@@ -88,8 +118,13 @@ class LayerTimingState:
 
     def record(self, name: str, elapsed_ms: float) -> None:
         self.steps_ms[name] = self.steps_ms.get(name, 0.0) + elapsed_ms
-        if _FORWARD is not None and name in _SUMMARY_STEPS:
+        if _FORWARD is None:
+            return
+        if name in _SUMMARY_STEPS:
             _FORWARD.accumulate(name, elapsed_ms)
+        elif name in _ROUTER_SUBSTEPS:
+            _FORWARD.accumulate(name, elapsed_ms)
+            _FORWARD.accumulate("router", elapsed_ms)
 
     def log(self) -> None:
         if not is_layer_timing_detail_enabled() or not self.steps_ms:
@@ -121,6 +156,16 @@ class ForwardPassTiming:
     def accumulate(self, name: str, elapsed_ms: float) -> None:
         self.steps_ms[name] = self.steps_ms.get(name, 0.0) + elapsed_ms
 
+    def _router_breakdown(self) -> str:
+        parts = []
+        for sub in _ROUTER_SUBSTEPS:
+            ms = self.steps_ms.get(sub)
+            if ms is not None and ms > 0.0:
+                parts.append(f"{_ROUTER_SUBSTEP_LABELS[sub]}={ms:.2f}")
+        if not parts:
+            return ""
+        return " [" + ", ".join(parts) + "]"
+
     def log(self) -> None:
         sync_compute_stream()
         total_ms = (time.perf_counter() - self._t0) * 1000.0
@@ -129,15 +174,17 @@ class ForwardPassTiming:
         moe = self.steps_ms.get("moe", 0.0)
         moe_compute = self.steps_ms.get("moe_compute", 0.0)
         other = max(0.0, total_ms - attn - router - moe)
+        router_detail = self._router_breakdown()
         logger.info(
             "[layer_timing] %s ntok=%d bs=%d "
-            "attn=%.2f ms router=%.2f ms moe=%.2f ms moe_compute=%.2f ms "
+            "attn=%.2f ms router=%.2f ms%s moe=%.2f ms moe_compute=%.2f ms "
             "other=%.2f ms total=%.2f ms",
             self.phase,
             self.num_tokens,
             self.batch_size,
             attn,
             router,
+            router_detail,
             moe,
             moe_compute,
             other,

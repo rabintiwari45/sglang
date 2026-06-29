@@ -336,17 +336,17 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         hidden_states = hidden_states.view(-1, hidden_dim)
 
         prefetcher = get_expert_prefetcher()
-        with layer_timing_step("router"):
-            if prefetcher is not None:
-                # Predicted-routing: the routing comes from the prediction made
-                # during the previous layer (and the matching experts have been
-                # prefetched). This also launches the next layer's prefetch.
-                topk_output = prefetcher.before_experts(
-                    self.layer_id, hidden_states, self.gate, self.topk
-                )
-            else:
+        if prefetcher is not None:
+            # Predicted-routing: routing + next-layer prefetch timing is inside
+            # ``before_experts`` (router_gate/topk/bind/predict_* substeps).
+            topk_output = prefetcher.before_experts(
+                self.layer_id, hidden_states, self.gate, self.topk
+            )
+        else:
+            with layer_timing_step("router_gate"):
                 # router_logits: (num_tokens, n_experts)
                 router_logits, _ = self.gate(hidden_states)
+            with layer_timing_step("router_topk"):
                 topk_output = self.topk(hidden_states, router_logits)
 
         with layer_timing_step("moe"):
@@ -373,10 +373,14 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
     def forward_deepep(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ) -> torch.Tensor:
-        with layer_timing_step("router"):
+        with layer_timing_step("router_gate"):
             if hidden_states.shape[0] > 0:
                 # router_logits: (num_tokens, n_experts)
                 router_logits, _ = self.gate(hidden_states)
+            else:
+                router_logits = None
+        with layer_timing_step("router_topk"):
+            if hidden_states.shape[0] > 0:
                 topk_output = self.topk(
                     hidden_states,
                     router_logits,
