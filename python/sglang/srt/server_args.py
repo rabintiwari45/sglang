@@ -694,6 +694,12 @@ class ServerArgs:
     offload_prefetch_step: int = 1
     offload_mode: str = "cpu"
 
+    # Router-predicted per-expert prefetch (MoE experts kept in CPU RAM, the
+    # predicted active experts for the next layer are streamed to GPU during the
+    # current layer's compute). Currently implemented for Qwen3-MoE.
+    enable_expert_prefetch: bool = False
+    expert_prefetch_resident_layers: str = "0"
+
     # Scoring configuration
     # Enable Multi-Item Scoring optimization. Combines query and multiple items
     # into a single sequence for efficient batch processing. Item boundaries are
@@ -6174,6 +6180,21 @@ class ServerArgs:
             type=str,
             default=ServerArgs.offload_mode,
             help="Mode of offloading.",
+        )
+        parser.add_argument(
+            "--enable-expert-prefetch",
+            action="store_true",
+            help="Keep MoE experts in CPU RAM and prefetch the predicted active "
+            "experts for the next layer to GPU during the current layer's compute "
+            "(router-predicted per-expert prefetch with on-miss fallback). "
+            "Currently implemented for Qwen3-MoE. Requires --disable-cuda-graph.",
+        )
+        parser.add_argument(
+            "--expert-prefetch-resident-layers",
+            type=str,
+            default=ServerArgs.expert_prefetch_resident_layers,
+            help="Comma-separated list of layer ids whose experts stay resident in "
+            "GPU VRAM when --enable-expert-prefetch is set (e.g. '0').",
         )
 
         # Args for multi-item-scoring

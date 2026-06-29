@@ -87,6 +87,11 @@ from sglang.srt.utils import (
     is_non_idle_and_non_empty,
     is_npu,
 )
+from sglang.srt.utils.expert_prefetch import (
+    ExpertPrefetcher,
+    get_expert_prefetcher,
+    set_expert_prefetcher,
+)
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 from sglang.srt.utils.layer_timing import begin_forward as layer_timing_begin_forward
 from sglang.srt.utils.layer_timing import end_forward as layer_timing_end_forward
@@ -330,10 +335,20 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
+        prefetcher = get_expert_prefetcher()
         with layer_timing_step("router"):
-            # router_logits: (num_tokens, n_experts)
-            router_logits, _ = self.gate(hidden_states)
-            topk_output = self.topk(hidden_states, router_logits)
+            if prefetcher is not None:
+                # Predicted-routing: the routing comes from the prediction made
+                # during the previous layer (and the matching experts have been
+                # prefetched). This also launches the next layer's prefetch.
+                topk_output = prefetcher.before_experts(
+                    self.layer_id, hidden_states, self.gate, self.topk
+                )
+            else:
+                # router_logits: (num_tokens, n_experts)
+                router_logits, _ = self.gate(hidden_states)
+                topk_output = self.topk(hidden_states, router_logits)
+
         with layer_timing_step("moe"):
             final_hidden_states = self.experts(hidden_states, topk_output)
 
@@ -953,6 +968,44 @@ class Qwen3MoeModel(Qwen2MoeModel):
             prefix=prefix,
             decoder_layer_type=decoder_layer_type,
             alt_stream=alt_stream,
+        )
+
+        self._maybe_init_expert_prefetch(config)
+
+    def _maybe_init_expert_prefetch(self, config: Qwen3MoeConfig) -> None:
+        server_args = get_global_server_args()
+        if not getattr(server_args, "enable_expert_prefetch", False):
+            return
+        if not _is_cuda:
+            logger.warning("[expert_prefetch] disabled: requires CUDA")
+            return
+        if not server_args.disable_cuda_graph or not getattr(
+            server_args, "disable_piecewise_cuda_graph", False
+        ):
+            raise ValueError(
+                "--enable-expert-prefetch requires --disable-cuda-graph and "
+                "--disable-piecewise-cuda-graph (experts are rebound to shared "
+                "buffers each step, which is incompatible with CUDA graph capture)."
+            )
+
+        from sglang.srt.utils.expert_prefetch import _parse_resident_layers
+
+        resident_layers = _parse_resident_layers(
+            server_args.expert_prefetch_resident_layers
+        )
+        prefetcher = ExpertPrefetcher(
+            layers=self.layers,
+            num_experts=config.num_experts
+            + server_args.ep_num_redundant_experts,
+            top_k=config.num_experts_per_tok,
+            resident_layers=resident_layers,
+        )
+        set_expert_prefetcher(prefetcher)
+        logger.info(
+            "[expert_prefetch] enabled: resident_layers=%s top_k=%d num_experts=%d",
+            sorted(resident_layers),
+            config.num_experts_per_tok,
+            config.num_experts + server_args.ep_num_redundant_experts,
         )
 
     def set_dflash_layers_to_capture(self, layers_to_capture: List[int]):

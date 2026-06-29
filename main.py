@@ -24,9 +24,13 @@ def main() -> None:
         tp_size=1,
         dtype="bfloat16",
         trust_remote_code=True,
-        # enable_expert_vm=True,
-        # expert_vm_resident_layers="0",
+        # Router-predicted per-expert prefetch: experts live in CPU RAM, the
+        # predicted active experts for the next layer are streamed to GPU during
+        # the current layer's compute (with on-miss fallback for correctness).
+        enable_expert_prefetch=True,
+        expert_prefetch_resident_layers="0",
         disable_cuda_graph=True,
+        disable_piecewise_cuda_graph=True,
         mem_fraction_static=MEM_FRACTION_STATIC,
         max_total_tokens=MAX_TOTAL_TOKENS,
         log_level="info",
@@ -37,7 +41,7 @@ def main() -> None:
 
     print("Model loaded successfully.")
 
-    outputs = llm.generate("Hello, how are you?", sampling_params={"max_new_tokens": 1000})
+    outputs = llm.generate("Hello, how are you?", sampling_params={"max_new_tokens": 10})
     print("--------------------------------")
     print("Outputs:")
     print(outputs)

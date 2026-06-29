@@ -746,6 +746,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Deduce KV cache dtype
         self.configure_kv_cache_dtype()
 
+        # Offload MoE experts to CPU now (before the KV pool is sized) so the
+        # freed VRAM is available to the memory pool. The router-predicted
+        # prefetch pipeline streams experts back in during forward.
+        if get_global_server_args().enable_expert_prefetch:
+            from sglang.srt.utils.expert_prefetch import get_expert_prefetcher
+
+            prefetcher = get_expert_prefetcher()
+            if prefetcher is not None:
+                prefetcher.maybe_init(self.device)
+
         # Init memory pool and attention backends
         self.init_memory_pool(pre_model_load_memory)
 
