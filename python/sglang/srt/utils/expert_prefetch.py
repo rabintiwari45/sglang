@@ -1,41 +1,24 @@
-"""Router-predicted per-expert prefetch for MoE models (predicted-routing mode).
+"""Router-predicted per-expert prefetch for MoE models (YALIS-style overlap).
 
-This implements a layer-wise prefetching pipeline that lets a Mixture-of-Experts
-model run with its expert weights stored in CPU RAM while only a small,
-double-buffered working set lives in GPU VRAM:
+Schedule (``num_prefetch_layers=2``):
 
-  * All expert weights are moved to pinned CPU memory (except a small set of
-    "resident" layers, e.g. layer 0, which stay in VRAM).
-  * Two GPU "expert buffers" hold one transformer layer's worth of expert
-    weights each (double buffering).
-  * While layer ``N`` runs its expert computation, layer ``N+1``'s routing is
-    *predicted* by running layer ``N+1``'s router (gate + topk) on layer ``N``'s
-    hidden states, and exactly the predicted experts are copied from CPU to GPU
-    on a side CUDA stream, hiding the PCIe transfer behind compute.
-  * **No fallback / predicted-routing only**: layer ``N+1`` then computes using
-    that predicted routing directly (it does *not* re-run its own router). Since
-    the routing is exactly the set of experts we prefetched, every routed expert
-    is guaranteed resident -- there are no misses by construction. This assumes
-    the prediction is correct (the true input to layer ``N+1``'s router is only
-    available after layer ``N`` finishes), so outputs are an approximation of the
-    unmodified model.
+  1. ``before_experts(L)``: wait/bind L; predict gate+topk for the next
+     offloaded layers not already in flight (usually just L+2).
+  2. MoE(L) runs alone — no concurrent PCIe.
+  3. ``after_experts(L)``: enqueue H2D for those layers.  L+2 hides behind
+     attn(L+1)+MoE(L+1)+attn(L+2).  L+1 was already launched from L-1.
 
-The first/resident layer has no predecessor and keeps all its experts in VRAM,
-so it uses its own real router.
+Uses ``num_prefetch_layers + 1`` GPU buffer sets (YALIS).  CPU expert storage
+is contiguous pinned memory so each row is one linear ``cudaMemcpyAsync``.
 
-The Marlin GPTQ MoE kernel (and the fp16/bf16 fused MoE kernel) index expert
-weights by *global* expert id, so each GPU buffer keeps the full
-``[num_experts, ...]`` shape and we only fill in the rows for the predicted
-experts; un-needed rows are left stale and never read.
-
-Enable via ``--enable-expert-prefetch`` (requires ``--disable-cuda-graph`` and
-``--disable-piecewise-cuda-graph``).
+Enable via ``--enable-expert-prefetch``.
 """
 
 from __future__ import annotations
 
+import ctypes
 import logging
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 
 import torch
 
@@ -43,9 +26,32 @@ from sglang.srt.utils.layer_timing import step as layer_timing_step
 
 logger = logging.getLogger(__name__)
 
-# Per-expert parameters are auto-detected (first dim == num_experts and
-# non-empty), so this works for both GPTQ-Marlin (w13_qweight/w2_qweight/
-# w13_scales/w2_scales/...) and the plain fused MoE (w13_weight/w2_weight).
+# cudaMemcpyKind: cudaMemcpyHostToDevice = 1
+_CUDA_MEMCPY_H2D = 1
+_cudart = None
+
+# How many offloaded layers to prefetch ahead of the current MoE.
+_DEFAULT_PREFETCH_LAYERS = 2
+
+
+def _get_cudart():
+    global _cudart
+    if _cudart is not None:
+        return _cudart
+    try:
+        _cudart = ctypes.CDLL("libcudart.so")
+        _cudart.cudaMemcpyAsync.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_int,
+            ctypes.c_void_p,
+        ]
+        _cudart.cudaMemcpyAsync.restype = ctypes.c_int
+    except OSError:
+        _cudart = False  # type: ignore[assignment]
+    return _cudart
+
 
 _instance: Optional["ExpertPrefetcher"] = None
 
@@ -69,12 +75,7 @@ def _parse_resident_layers(spec: str) -> Set[int]:
 
 
 class ExpertPrefetcher:
-    """Drives the predicted per-expert prefetch pipeline for one model.
-
-    The model is expected to call :meth:`on_moe` from each sparse MoE block,
-    right after the real router has produced ``topk_ids`` and immediately before
-    the expert computation runs.
-    """
+    """YALIS-style predicted per-expert prefetch for one MoE model."""
 
     def __init__(
         self,
@@ -82,6 +83,7 @@ class ExpertPrefetcher:
         num_experts: int,
         top_k: int,
         resident_layers: Set[int],
+        num_prefetch_layers: int = _DEFAULT_PREFETCH_LAYERS,
         get_gate=lambda layer: layer.mlp.gate,
         get_topk=lambda layer: layer.mlp.topk,
         get_experts=lambda layer: layer.mlp.experts,
@@ -91,6 +93,7 @@ class ExpertPrefetcher:
         self.num_experts = num_experts
         self.top_k = top_k
         self.resident_layers = resident_layers
+        self.num_prefetch_layers = max(1, int(num_prefetch_layers))
         self._get_gate = get_gate
         self._get_topk = get_topk
         self._get_experts = get_experts
@@ -98,32 +101,51 @@ class ExpertPrefetcher:
 
         self._initialized = False
         self._device: Optional[torch.device] = None
-        self._side_stream: Optional[torch.cuda.Stream] = None
+        self._transfer_stream: Optional[torch.cuda.Stream] = None
 
-        # Per-expert parameter names that we shuttle between CPU and GPU.
         self._param_names: List[str] = []
-
-        # cpu_store[layer_id][param_name] -> pinned CPU tensor of shape [E, ...]
         self._cpu_store: Dict[int, Dict[str, torch.Tensor]] = {}
-        # Sparse layer ids that are offloaded (i.e. not resident).
         self._offloaded_layers: List[int] = []
+        self._gpu_layout: Dict[str, Tuple[tuple, tuple, torch.dtype]] = {}
 
-        # Double buffer: list of two dicts {param_name -> cuda tensor [E, ...]}.
+        # YALIS: num_buffer_sets = num_prefetch_layers + 1
+        self._num_buffers = self.num_prefetch_layers + 1
         self._buffers: List[Dict[str, torch.Tensor]] = []
-        self._toggle = 0
+        self._next_buf = 0
 
-        # Bookkeeping for the in-flight prefetch of each layer.
         self._layer_buf: Dict[int, int] = {}
-        self._events: Dict[int, torch.cuda.Event] = {}
-        # The routing (TopK output) predicted for each layer one step ahead.
+        self._event_pool: Dict[int, torch.cuda.Event] = {}
+        self._transfer_events: Dict[int, torch.cuda.Event] = {}
         self._predicted_topk: Dict[int, object] = {}
+        # Layers whose H2D has been enqueued (or is about to be).
+        self._dma_started: Set[int] = set()
 
-        # Stats (host-side counters; cheap).
+        self._ids_pin: Optional[torch.Tensor] = None
+        # Prepared at before_experts; consumed by after_experts.
+        self._pending_prefetches: List[dict] = []
+
         self.stat_layers = 0
         self.stat_predicted = 0
         self.stat_cold = 0
+        self._use_batch_copy: Optional[bool] = None
 
     # ------------------------------------------------------------------ init
+
+    def _resolve_batch_copy(self) -> bool:
+        if self._use_batch_copy is not None:
+            return self._use_batch_copy
+        try:
+            from sgl_kernel.expert_prefetch import expert_prefetch_copy  # noqa: F401
+
+            self._use_batch_copy = True
+            logger.info("[expert_prefetch] using sgl_kernel batched H2D copy")
+        except (ImportError, AttributeError, RuntimeError):
+            self._use_batch_copy = False
+            logger.info(
+                "[expert_prefetch] sgl_kernel batched copy unavailable; "
+                "using contiguous pinned cudaMemcpyAsync"
+            )
+        return self._use_batch_copy
 
     def _detect_param_names(self, experts: torch.nn.Module) -> List[str]:
         names = []
@@ -138,9 +160,8 @@ class ExpertPrefetcher:
         if self._initialized:
             return
         self._device = device if isinstance(device, torch.device) else torch.device(device)
-        self._side_stream = torch.cuda.Stream(device=self._device)
+        self._transfer_stream = torch.cuda.Stream(device=self._device)
 
-        # Find sparse layers and split into resident vs offloaded.
         sparse_layer_ids = [
             i for i, layer in enumerate(self.layers) if self._is_sparse(layer)
         ]
@@ -154,10 +175,17 @@ class ExpertPrefetcher:
             self._initialized = True
             return
 
-        # Auto-detect the per-expert params from the first offloaded layer.
         sample_experts = self._get_experts(self.layers[self._offloaded_layers[0]])
         self._param_names = self._detect_param_names(sample_experts)
         assert self._param_names, "could not detect per-expert weight parameters"
+
+        for name in self._param_names:
+            p = getattr(sample_experts, name)
+            self._gpu_layout[name] = (
+                tuple(p.data.size()),
+                tuple(p.data.stride()),
+                p.data.dtype,
+            )
 
         pin = True
         moved_bytes = 0
@@ -166,38 +194,40 @@ class ExpertPrefetcher:
             store: Dict[str, torch.Tensor] = {}
             for name in self._param_names:
                 p = getattr(experts, name)
-                cpu = self._to_pinned_cpu(p.data, pin)
+                cpu = self._to_pinned_contiguous(p.data, pin)
                 pin = cpu.is_pinned()
                 store[name] = cpu
                 moved_bytes += cpu.numel() * cpu.element_size()
-                # Free the GPU copy; the param will be rebound to a shared
-                # buffer at compute time.
                 p.data = torch.empty(0, dtype=cpu.dtype, device=self._device)
             self._cpu_store[layer_id] = store
+            self._event_pool[layer_id] = torch.cuda.Event()
 
-        # Allocate the two GPU buffers, sized to one layer's expert weights.
-        sample_store = self._cpu_store[self._offloaded_layers[0]]
-        for _ in range(2):
+        for _ in range(self._num_buffers):
             buf = {
                 name: torch.empty_strided(
-                    size=t.size(),
-                    stride=t.stride(),
-                    dtype=t.dtype,
+                    size=self._gpu_layout[name][0],
+                    stride=self._gpu_layout[name][1],
+                    dtype=self._gpu_layout[name][2],
                     device=self._device,
                 )
-                for name, t in sample_store.items()
+                for name in self._param_names
             }
             self._buffers.append(buf)
+
+        self._ids_pin = torch.empty(self.num_experts, dtype=torch.long, pin_memory=True)
 
         torch.cuda.empty_cache()
         logger.info(
             "[expert_prefetch] init: offloaded %d layers, params=%s, "
-            "moved %.2f GB to %s CPU, 2x GPU buffers (%.2f GB total)",
+            "moved %.2f GB to %s contiguous CPU, %dx GPU buffers (%.2f GB total), "
+            "prefetch_ahead=%d, H2D after MoE",
             len(self._offloaded_layers),
             self._param_names,
             moved_bytes / 1024**3,
             "pinned" if pin else "pageable",
-            2 * self._buffer_bytes() / 1024**3,
+            self._num_buffers,
+            self._num_buffers * self._buffer_bytes() / 1024**3,
+            self.num_prefetch_layers,
         )
         self._initialized = True
 
@@ -206,24 +236,91 @@ class ExpertPrefetcher:
             return 0
         return sum(t.numel() * t.element_size() for t in self._buffers[0].values())
 
-    def _to_pinned_cpu(self, data: torch.Tensor, pin: bool) -> torch.Tensor:
-        try:
-            cpu = torch.empty_strided(
-                size=data.size(),
-                stride=data.stride(),
-                dtype=data.dtype,
-                device="cpu",
-                pin_memory=pin,
-            )
-        except RuntimeError:
-            cpu = torch.empty_strided(
-                size=data.size(),
-                stride=data.stride(),
-                dtype=data.dtype,
-                device="cpu",
-            )
-        cpu.copy_(data)
-        return cpu
+    def _to_pinned_contiguous(self, data: torch.Tensor, pin: bool) -> torch.Tensor:
+        host = data.detach().to("cpu", non_blocking=False).contiguous()
+        if pin:
+            try:
+                return host.pin_memory()
+            except RuntimeError:
+                return host
+        return host
+
+    # -------------------------------------------------------------- helpers
+
+    def _expert_ids_cpu(self, topk_ids: torch.Tensor) -> List[int]:
+        flat = topk_ids.detach().reshape(-1)
+        host = flat.to("cpu", dtype=torch.long, non_blocking=False).tolist()
+        return sorted({int(e) for e in host if 0 <= int(e) < self.num_experts})
+
+    def _alloc_buf(self) -> int:
+        idx = self._next_buf
+        self._next_buf = (self._next_buf + 1) % self._num_buffers
+        return idx
+
+    def _next_offloaded_layers(self, layer_id: int, n: int) -> List[int]:
+        """Return up to ``n`` offloaded layer ids strictly after ``layer_id``."""
+        out: List[int] = []
+        nxt = layer_id + 1
+        while nxt < len(self.layers) and len(out) < n:
+            if nxt in self._cpu_store:
+                out.append(nxt)
+            nxt += 1
+        return out
+
+    def _copy_experts(
+        self,
+        buf: Dict[str, torch.Tensor],
+        store: Dict[str, torch.Tensor],
+        ids: List[int],
+    ) -> None:
+        """Enqueue H2D of selected expert rows on the *current* CUDA stream."""
+        if not ids:
+            return
+
+        if self._resolve_batch_copy():
+            from sgl_kernel.expert_prefetch import expert_prefetch_copy
+
+            n = len(ids)
+            id_buf = self._ids_pin[:n]
+            for i, e in enumerate(ids):
+                id_buf[i] = e
+            srcs = [store[name] for name in self._param_names]
+            dsts = [buf[name] for name in self._param_names]
+            expert_prefetch_copy(srcs, dsts, id_buf, False)
+            return
+
+        cudart = _get_cudart()
+        if cudart:
+            stream = torch.cuda.current_stream().cuda_stream
+            for name in self._param_names:
+                src = store[name]
+                dst = buf[name]
+                src_stride = src.stride(0) * src.element_size()
+                dst_stride = dst.stride(0) * dst.element_size()
+                row_bytes = src[0].numel() * src.element_size()
+                src_base = src.data_ptr()
+                dst_base = dst.data_ptr()
+                for e in ids:
+                    err = cudart.cudaMemcpyAsync(
+                        ctypes.c_void_p(dst_base + e * dst_stride),
+                        ctypes.c_void_p(src_base + e * src_stride),
+                        ctypes.c_size_t(row_bytes),
+                        _CUDA_MEMCPY_H2D,
+                        ctypes.c_void_p(stream),
+                    )
+                    if err != 0:
+                        break
+                else:
+                    continue
+                for e in ids:
+                    dst[e].copy_(src[e], non_blocking=True)
+            return
+
+        for name in self._param_names:
+            src = store[name]
+            dst = buf[name]
+            for e in ids:
+                dst[e].copy_(src[e], non_blocking=True)
 
     # -------------------------------------------------------------- pipeline
 
@@ -234,17 +331,7 @@ class ExpertPrefetcher:
         gate: torch.nn.Module,
         topk: torch.nn.Module,
     ):
-        """Return the TopK routing to use for this layer's expert computation.
-
-        For a resident/first layer (or a cold start) this runs the layer's own
-        real router. For an offloaded layer it returns the routing that was
-        *predicted* during the previous layer (and whose experts have been
-        prefetched into a GPU buffer), binding the experts module to that buffer.
-
-        It also launches the predicted prefetch for the next layer, which runs on
-        a side stream and overlaps with this layer's expert compute.
-        """
-        # Empty batches (e.g. padding-only): fall back to the plain router path.
+        """Bind L, predict next ``num_prefetch_layers``.  H2D in ``after_experts``."""
         if hidden_states is None or hidden_states.shape[0] == 0:
             with layer_timing_step("router_gate"):
                 router_logits, _ = gate(hidden_states)
@@ -260,108 +347,124 @@ class ExpertPrefetcher:
                 return topk(hidden_states, router_logits)
 
         if layer_id in self._predicted_topk:
-            # Predicted-routing path: use the routing decided one layer earlier
-            # and bind the experts to the buffer that holds those experts.
             topk_output = self._predicted_topk.pop(layer_id)
             with layer_timing_step("router_bind"):
-                self._bind_resident(layer_id)
+                self._wait_and_bind(layer_id)
             self.stat_layers += 1
         else:
-            # Resident/first layer or cold start: use the real router.
             with layer_timing_step("router_gate"):
                 router_logits, _ = gate(hidden_states)
             with layer_timing_step("router_topk"):
                 topk_output = topk(hidden_states, router_logits)
             if layer_id in self._cpu_store:
-                # Cold start safety (e.g. a non-resident first layer): the
-                # experts were never prefetched, so load the routed ones now.
                 self.stat_cold += 1
                 with layer_timing_step("router_cold_load"):
                     self._cold_load(layer_id, topk_output.topk_ids)
 
-        # Kick off the predicted prefetch for the next sparse layer; this runs
-        # on the side stream and overlaps with this layer's expert compute.
-        self._launch_prefetch(self._next_offloaded_layer(layer_id), hidden_states)
+        # Predict any of the next N offloaded layers not already in flight.
+        self._pending_prefetches = []
+        for target in self._next_offloaded_layers(
+            layer_id, self.num_prefetch_layers
+        ):
+            if target in self._predicted_topk or target in self._dma_started:
+                continue
+            item = self._prepare_prefetch(target, hidden_states, from_layer=layer_id)
+            if item is not None:
+                self._pending_prefetches.append(item)
+
         return topk_output
 
-    def _next_offloaded_layer(self, layer_id: int) -> Optional[int]:
-        nxt = layer_id + 1
-        while nxt < len(self.layers):
-            if nxt in self._cpu_store:
-                return nxt
-            nxt += 1
-        return None
+    def after_experts(self, layer_id: int) -> None:
+        """Enqueue H2D for layers predicted in ``before_experts`` (overlaps attn)."""
+        if not self._initialized or not self._offloaded_layers:
+            return
+        pending = self._pending_prefetches
+        if not pending:
+            return
+        mine = [p for p in pending if p.get("from_layer") == layer_id]
+        self._pending_prefetches = [
+            p for p in pending if p.get("from_layer") != layer_id
+        ]
+        if not mine:
+            return
+        self._start_prefetch_dmas(mine)
 
-    def _bind_resident(self, layer_id: int) -> None:
-        """Wait for this layer's prefetch and point its experts at the buffer."""
+    def _wait_and_bind(self, layer_id: int) -> None:
         experts = self._get_experts(self.layers[layer_id])
         buf_idx = self._layer_buf[layer_id]
-        event = self._events.get(layer_id)
+        event = self._transfer_events.pop(layer_id, None)
         if event is not None:
             torch.cuda.current_stream().wait_event(event)
+        self._dma_started.discard(layer_id)
         buf = self._buffers[buf_idx]
         for name in self._param_names:
             getattr(experts, name).data = buf[name]
 
     def _cold_load(self, layer_id: int, topk_ids: torch.Tensor) -> None:
-        buf_idx = self._toggle
-        self._toggle ^= 1
+        buf_idx = self._alloc_buf()
         self._layer_buf[layer_id] = buf_idx
         buf = self._buffers[buf_idx]
         experts = self._get_experts(self.layers[layer_id])
         for name in self._param_names:
             getattr(experts, name).data = buf[name]
-        ids = [e for e in torch.unique(topk_ids).tolist() if 0 <= e < self.num_experts]
+
+        ids = self._expert_ids_cpu(topk_ids)
         store = self._cpu_store[layer_id]
-        for name in self._param_names:
-            dst = buf[name]
-            src = store[name]
-            for e in ids:
-                dst[e].copy_(src[e], non_blocking=True)
+        compute = torch.cuda.current_stream()
+        with torch.cuda.stream(self._transfer_stream):
+            self._transfer_stream.wait_stream(compute)
+            self._copy_experts(buf, store, ids)
+        compute.wait_stream(self._transfer_stream)
 
-    def _launch_prefetch(
-        self, layer_id: Optional[int], hidden_states: torch.Tensor
-    ) -> None:
-        if layer_id is None or layer_id not in self._cpu_store:
-            return
+    def _prepare_prefetch(
+        self,
+        layer_id: int,
+        hidden_states: torch.Tensor,
+        from_layer: int,
+    ) -> Optional[dict]:
+        if layer_id not in self._cpu_store:
+            return None
 
-        # Predict the next layer's routing by running its real router (gate +
-        # topk) on the current hidden states. This same routing will be used for
-        # that layer's expert computation (predicted-routing, no fallback).
         gate = self._get_gate(self.layers[layer_id])
-        topk = self._get_topk(self.layers[layer_id])
+        topk_mod = self._get_topk(self.layers[layer_id])
         with torch.no_grad():
             with layer_timing_step("router_predict_gate"):
                 router_logits, _ = gate(hidden_states)
             with layer_timing_step("router_predict_topk"):
-                topk_output = topk(hidden_states, router_logits)
-        predicted_ids = [
-            e
-            for e in torch.unique(topk_output.topk_ids).tolist()
-            if 0 <= e < self.num_experts
-        ]
+                topk_output = topk_mod(hidden_states, router_logits)
+
+        predicted_ids = self._expert_ids_cpu(topk_output.topk_ids)
         self.stat_predicted += len(predicted_ids)
         self._predicted_topk[layer_id] = topk_output
 
-        buf_idx = self._toggle
-        self._toggle ^= 1
+        buf_idx = self._alloc_buf()
         self._layer_buf[layer_id] = buf_idx
-        buf = self._buffers[buf_idx]
-        store = self._cpu_store[layer_id]
 
-        # Make the side stream wait for all prior default-stream work so we
-        # never overwrite a buffer that the previous layer is still reading.
+        return {
+            "layer_id": layer_id,
+            "from_layer": from_layer,
+            "ids": predicted_ids,
+            "buf_idx": buf_idx,
+        }
+
+    def _start_prefetch_dmas(self, pending_list: List[dict]) -> None:
+        """Enqueue H2D on the transfer stream (sync CPU, async GPU)."""
+        compute = torch.cuda.current_stream()
+
         with layer_timing_step("router_predict_launch"):
-            self._side_stream.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(self._side_stream):
-                for name in self._param_names:
-                    dst = buf[name]
-                    src = store[name]
-                    for e in predicted_ids:
-                        dst[e].copy_(src[e], non_blocking=True)
-                event = torch.cuda.Event()
-                event.record(self._side_stream)
-        self._events[layer_id] = event
+            with torch.cuda.stream(self._transfer_stream):
+                self._transfer_stream.wait_stream(compute)
+                for pending in pending_list:
+                    layer_id = pending["layer_id"]
+                    ids = pending["ids"]
+                    buf_idx = pending["buf_idx"]
+                    buf = self._buffers[buf_idx]
+                    store = self._cpu_store[layer_id]
+                    event = self._event_pool[layer_id]
+                    self._transfer_events[layer_id] = event
+                    self._dma_started.add(layer_id)
+                    self._copy_experts(buf, store, ids)
+                    event.record(self._transfer_stream)
 
     def log_stats(self) -> None:
         if self.stat_layers == 0:
@@ -369,8 +472,9 @@ class ExpertPrefetcher:
         avg = self.stat_predicted / max(1, self.stat_layers)
         logger.info(
             "[expert_prefetch] predicted-routing layers=%d avg_experts_prefetched=%.1f "
-            "cold_starts=%d",
+            "cold_starts=%d prefetch_ahead=%d",
             self.stat_layers,
             avg,
             self.stat_cold,
+            self.num_prefetch_layers,
         )

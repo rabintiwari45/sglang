@@ -352,6 +352,13 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("transfer_kv_all_layer_direct_lf_pf", torch::kCUDA, &transfer_kv_all_layer_direct_lf_pf);
 
   /*
+   * From csrc/expert_prefetch
+   */
+  m.def(
+      "expert_prefetch_copy(Tensor[] srcs, Tensor[] dsts, Tensor expert_ids, bool copy_all) -> ()");
+  m.impl("expert_prefetch_copy", torch::kCUDA, &expert_prefetch_copy);
+
+  /*
    * From csrc/memory
    */
   m.def("weak_ref_tensor(Tensor tensor) -> Tensor");

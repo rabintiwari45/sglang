@@ -52,7 +52,8 @@ STEP_ORDER: List[str] = [
 
 _SUMMARY_STEPS = frozenset({"attn", "router", "moe", "moe_compute"})
 
-# Sub-steps that roll up into the top-level ``router`` bucket in the summary.
+# Sub-steps shown in the router breakdown.  Critical ones (before MoE) roll
+# into the top-level ``router`` total.
 _ROUTER_SUBSTEPS: List[str] = [
     "router_gate",
     "router_topk",
@@ -62,6 +63,20 @@ _ROUTER_SUBSTEPS: List[str] = [
     "router_predict_topk",
     "router_predict_launch",
 ]
+# All router substeps that consume wall time on the forward critical path.
+# ``predict_launch`` runs after MoE but still blocks the Python thread before
+# attn starts, so it must count somewhere other than the residual ``other``.
+_ROUTER_CRITICAL_SUBSTEPS = frozenset(
+    {
+        "router_gate",
+        "router_topk",
+        "router_bind",
+        "router_cold_load",
+        "router_predict_gate",
+        "router_predict_topk",
+        "router_predict_launch",
+    }
+)
 _ROUTER_SUBSTEP_LABELS = {
     "router_gate": "gate",
     "router_topk": "topk",
@@ -71,6 +86,15 @@ _ROUTER_SUBSTEP_LABELS = {
     "router_predict_topk": "predict_topk",
     "router_predict_launch": "predict_launch",
 }
+
+# ``predict_launch`` only submits a background H2D thread — must not sync
+# (would wait on PCIe).  Predict gate/topk run on the compute stream before
+# MoE and must sync so their time is not billed to ``moe``.
+_NO_SYNC_STEPS = frozenset(
+    {
+        "router_predict_launch",
+    }
+)
 
 
 def is_layer_timing_enabled() -> bool:
@@ -124,7 +148,8 @@ class LayerTimingState:
             _FORWARD.accumulate(name, elapsed_ms)
         elif name in _ROUTER_SUBSTEPS:
             _FORWARD.accumulate(name, elapsed_ms)
-            _FORWARD.accumulate("router", elapsed_ms)
+            if name in _ROUTER_CRITICAL_SUBSTEPS:
+                _FORWARD.accumulate("router", elapsed_ms)
 
     def log(self) -> None:
         if not is_layer_timing_detail_enabled() or not self.steps_ms:
@@ -252,10 +277,13 @@ def step(name: str) -> Iterator[None]:
         yield
         return
 
-    sync_compute_stream()
+    no_sync = name in _NO_SYNC_STEPS
+    if not no_sync:
+        sync_compute_stream()
     start = time.perf_counter()
     try:
         yield
     finally:
-        sync_compute_stream()
+        if not no_sync:
+            sync_compute_stream()
         _ACTIVE.record(name, (time.perf_counter() - start) * 1000.0)

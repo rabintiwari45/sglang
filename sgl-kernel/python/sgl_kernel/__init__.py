@@ -71,6 +71,7 @@ else:
         sgl_per_token_quant_fp8,
         shuffle_rows,
     )
+    from sgl_kernel.expert_prefetch import expert_prefetch_copy
     from sgl_kernel.grammar import apply_token_bitmask_inplace_cuda
     from sgl_kernel.kvcacheio import (
         transfer_kv_all_layer,

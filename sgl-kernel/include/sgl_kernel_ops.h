@@ -650,6 +650,12 @@ void transfer_kv_all_layer_direct_lf_pf(
     const at::Tensor& dst_indices,
     int64_t page_size);
 
+void expert_prefetch_copy(
+    const std::vector<at::Tensor>& srcs,
+    const std::vector<at::Tensor>& dsts,
+    const at::Tensor& expert_ids,
+    bool copy_all);
+
 /*
  * From csrc/memory
  */

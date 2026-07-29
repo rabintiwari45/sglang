@@ -337,8 +337,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 
         prefetcher = get_expert_prefetcher()
         if prefetcher is not None:
-            # Predicted-routing: routing + next-layer prefetch timing is inside
-            # ``before_experts`` (router_gate/topk/bind/predict_* substeps).
+            # Bind L + predict L+1.  H2D starts in after_experts (overlaps attn).
             topk_output = prefetcher.before_experts(
                 self.layer_id, hidden_states, self.gate, self.topk
             )
@@ -351,6 +350,9 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 
         with layer_timing_step("moe"):
             final_hidden_states = self.experts(hidden_states, topk_output)
+
+        if prefetcher is not None:
+            prefetcher.after_experts(self.layer_id)
 
         if self.ep_size > 1 and not should_skip_post_experts_all_reduce(
             is_tp_path=False,
@@ -1003,13 +1005,16 @@ class Qwen3MoeModel(Qwen2MoeModel):
             + server_args.ep_num_redundant_experts,
             top_k=config.num_experts_per_tok,
             resident_layers=resident_layers,
+            num_prefetch_layers=2,
         )
         set_expert_prefetcher(prefetcher)
         logger.info(
-            "[expert_prefetch] enabled: resident_layers=%s top_k=%d num_experts=%d",
+            "[expert_prefetch] enabled: resident_layers=%s top_k=%d "
+            "num_experts=%d prefetch_ahead=%d",
             sorted(resident_layers),
             config.num_experts_per_tok,
             config.num_experts + server_args.ep_num_redundant_experts,
+            prefetcher.num_prefetch_layers,
         )
 
     def set_dflash_layers_to_capture(self, layers_to_capture: List[int]):
