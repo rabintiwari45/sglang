@@ -1006,6 +1006,7 @@ class Qwen3MoeModel(Qwen2MoeModel):
             top_k=config.num_experts_per_tok,
             resident_layers=resident_layers,
             num_prefetch_layers=2,
+            cache_slots=getattr(server_args, "expert_prefetch_cache_slots", 32),
         )
         set_expert_prefetcher(prefetcher)
         logger.info(

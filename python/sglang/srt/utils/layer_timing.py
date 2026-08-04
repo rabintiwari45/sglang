@@ -87,11 +87,14 @@ _ROUTER_SUBSTEP_LABELS = {
     "router_predict_launch": "predict_launch",
 }
 
-# ``predict_launch`` only submits a background H2D thread — must not sync
-# (would wait on PCIe).  Predict gate/topk run on the compute stream before
-# MoE and must sync so their time is not billed to ``moe``.
+# Prediction steps only enqueue kernels / hand work to the background
+# transfer worker — they must not sync (that would serialize the CPU with
+# the GPU each layer and stall the prefetch pipeline).  Their small GPU time
+# is billed to the following synced step instead.
 _NO_SYNC_STEPS = frozenset(
     {
+        "router_predict_gate",
+        "router_predict_topk",
         "router_predict_launch",
     }
 )

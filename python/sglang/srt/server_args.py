@@ -699,6 +699,9 @@ class ServerArgs:
     # current layer's compute). Currently implemented for Qwen3-MoE.
     enable_expert_prefetch: bool = False
     expert_prefetch_resident_layers: str = "0"
+    # Per-layer GPU expert-cache capacity (rows) used by expert prefetch to
+    # serve repeated experts without PCIe traffic. 0 disables the cache.
+    expert_prefetch_cache_slots: int = 32
 
     # Scoring configuration
     # Enable Multi-Item Scoring optimization. Combines query and multiple items
@@ -6195,6 +6198,14 @@ class ServerArgs:
             default=ServerArgs.expert_prefetch_resident_layers,
             help="Comma-separated list of layer ids whose experts stay resident in "
             "GPU VRAM when --enable-expert-prefetch is set (e.g. '0').",
+        )
+        parser.add_argument(
+            "--expert-prefetch-cache-slots",
+            type=int,
+            default=ServerArgs.expert_prefetch_cache_slots,
+            help="Per-layer GPU expert-cache capacity (rows) for "
+            "--enable-expert-prefetch. Cached experts are restored via fast "
+            "device-to-device copies instead of PCIe. 0 disables the cache.",
         )
 
         # Args for multi-item-scoring

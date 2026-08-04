@@ -153,6 +153,63 @@ void append_expert_row_copies(
 
 }  // namespace
 
+void expert_cache_copy(
+    const std::vector<at::Tensor>& srcs,
+    const std::vector<at::Tensor>& dsts,
+    const at::Tensor& src_rows,
+    const at::Tensor& dst_rows) {
+  // Copy srcs[i][src_rows[j]] -> dsts[i][dst_rows[j]] for every tensor pair
+  // and row pair, on the current stream.  Tensors may live on host (pinned)
+  // or device; direction is resolved per pair (cudaMemcpyDefault / UVA).
+  // Used for expert-cache hit restores (D2D) and cache inserts (D2D).
+  TORCH_CHECK(srcs.size() == dsts.size(), "expert_cache_copy: src/dst list size mismatch");
+  TORCH_CHECK(!srcs.empty(), "expert_cache_copy: empty tensor list");
+
+  at::Tensor src_rows_cpu = src_rows.contiguous().to(at::kCPU, at::kLong);
+  at::Tensor dst_rows_cpu = dst_rows.contiguous().to(at::kCPU, at::kLong);
+  const int64_t n = src_rows_cpu.numel();
+  TORCH_CHECK(
+      dst_rows_cpu.numel() == n, "expert_cache_copy: src_rows/dst_rows length mismatch");
+  if (n == 0) {
+    return;
+  }
+  const int64_t* srow = src_rows_cpu.data_ptr<int64_t>();
+  const int64_t* drow = dst_rows_cpu.data_ptr<int64_t>();
+
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+  for (const auto i : c10::irange(srcs.size())) {
+    const at::Tensor& src = srcs[i];
+    const at::Tensor& dst = dsts[i];
+    TORCH_CHECK(src.dim() >= 1 && dst.dim() >= 1, "expert_cache_copy: tensors must be >= 1D");
+
+    const int64_t src_pitch = src.stride(0) * src.element_size();
+    const int64_t dst_pitch = dst.stride(0) * dst.element_size();
+    const size_t row_bytes = static_cast<size_t>(
+        (src.numel() / src.size(0)) * src.element_size());
+    TORCH_CHECK(
+        row_bytes == static_cast<size_t>((dst.numel() / dst.size(0)) * dst.element_size()),
+        "expert_cache_copy: row byte size mismatch at tensor ",
+        i);
+
+    const char* src_base = static_cast<const char*>(src.data_ptr());
+    char* dst_base = static_cast<char*>(dst.data_ptr());
+
+    for (int64_t j = 0; j < n; ++j) {
+      const int64_t s = srow[j];
+      const int64_t d = drow[j];
+      TORCH_CHECK(s >= 0 && s < src.size(0), "expert_cache_copy: src row out of range: ", s);
+      TORCH_CHECK(d >= 0 && d < dst.size(0), "expert_cache_copy: dst row out of range: ", d);
+      C10_CUDA_CHECK(cudaMemcpyAsync(
+          dst_base + d * dst_pitch,
+          src_base + s * src_pitch,
+          row_bytes,
+          cudaMemcpyDefault,
+          stream));
+    }
+  }
+}
+
 void expert_prefetch_copy(
     const std::vector<at::Tensor>& srcs,
     const std::vector<at::Tensor>& dsts,
@@ -227,8 +284,10 @@ void expert_prefetch_copy(
 
 TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("expert_prefetch_copy(Tensor[] srcs, Tensor[] dsts, Tensor expert_ids, bool copy_all) -> ()");
+  m.def("expert_cache_copy(Tensor[] srcs, Tensor[] dsts, Tensor src_rows, Tensor dst_rows) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(sgl_kernel, CUDA, m) {
   m.impl("expert_prefetch_copy", &expert_prefetch_copy);
+  m.impl("expert_cache_copy", &expert_cache_copy);
 }
