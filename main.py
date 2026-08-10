@@ -16,6 +16,10 @@ MODEL_PATH = "Qwen/Qwen3-30B-A3B-GPTQ-Int4"
 MEM_FRACTION_STATIC = 0.8
 MAX_TOTAL_TOKENS = 1000  # ~9 GB KV at bf16; was ~790k (~72 GB) at 0.80
 
+# Per-layer GPU expert-row cache (LRU). 32 ≈ ~3.4 GB VRAM, ~95 ms decode on L4.
+# Set to 0 to disable cache and measure prefetch-only (~125 ms decode).
+EXPERT_PREFETCH_CACHE_SLOTS = 96
+
 def main() -> None:
     print(f"Loading {MODEL_PATH}...")
 
@@ -29,6 +33,7 @@ def main() -> None:
         # the current layer's compute (with on-miss fallback for correctness).
         enable_expert_prefetch=True,
         expert_prefetch_resident_layers="0",
+        expert_prefetch_cache_slots=EXPERT_PREFETCH_CACHE_SLOTS,
         disable_cuda_graph=True,
         disable_piecewise_cuda_graph=True,
         mem_fraction_static=MEM_FRACTION_STATIC,
@@ -41,7 +46,7 @@ def main() -> None:
 
     print("Model loaded successfully.")
 
-    outputs = llm.generate("Hello, how are you?", sampling_params={"max_new_tokens": 100})
+    outputs = llm.generate("Hello, how are you?", sampling_params={"max_new_tokens": 20})
     print("--------------------------------")
     print("Outputs:")
     print(outputs)
