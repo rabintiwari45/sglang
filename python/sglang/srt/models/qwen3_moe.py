@@ -88,6 +88,10 @@ from sglang.srt.utils import (
     is_npu,
 )
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
+from sglang.srt.utils.layer_timing import begin_forward as layer_timing_begin_forward
+from sglang.srt.utils.layer_timing import end_forward as layer_timing_end_forward
+from sglang.srt.utils.layer_timing import layer as layer_timing_layer
+from sglang.srt.utils.layer_timing import step as layer_timing_step
 
 _is_cuda = is_cuda()
 
@@ -326,49 +330,61 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
-        # router_logits: (num_tokens, n_experts)
-        router_logits, _ = self.gate(hidden_states)
-        topk_output = self.topk(hidden_states, router_logits)
-        final_hidden_states = self.experts(hidden_states, topk_output)
+        with layer_timing_step("router_gate"):
+            # router_logits: (num_tokens, n_experts)
+            router_logits, _ = self.gate(hidden_states)
+        with layer_timing_step("router_topk"):
+            topk_output = self.topk(hidden_states, router_logits)
 
-        if self.ep_size > 1 and not should_skip_post_experts_all_reduce(
-            is_tp_path=False,
-            use_reduce_scatter=use_reduce_scatter,
-            should_allreduce_fusion=should_allreduce_fusion,
-        ):
-            final_hidden_states = moe_expert_parallel_all_reduce(final_hidden_states)
+        with layer_timing_step("moe"):
+            final_hidden_states = self.experts(hidden_states, topk_output)
 
-        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
-            is_tp_path=True,
-            use_reduce_scatter=use_reduce_scatter,
-            should_allreduce_fusion=should_allreduce_fusion,
-        ):
-            final_hidden_states = moe_tensor_model_parallel_all_reduce(
-                final_hidden_states
-            )
+            if self.ep_size > 1 and not should_skip_post_experts_all_reduce(
+                is_tp_path=False,
+                use_reduce_scatter=use_reduce_scatter,
+                should_allreduce_fusion=should_allreduce_fusion,
+            ):
+                final_hidden_states = moe_expert_parallel_all_reduce(
+                    final_hidden_states
+                )
+
+            if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
+                is_tp_path=True,
+                use_reduce_scatter=use_reduce_scatter,
+                should_allreduce_fusion=should_allreduce_fusion,
+            ):
+                final_hidden_states = moe_tensor_model_parallel_all_reduce(
+                    final_hidden_states
+                )
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 
     def forward_deepep(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ) -> torch.Tensor:
-        if hidden_states.shape[0] > 0:
-            # router_logits: (num_tokens, n_experts)
-            router_logits, _ = self.gate(hidden_states)
-            topk_output = self.topk(
-                hidden_states,
-                router_logits,
-                num_token_non_padded=forward_batch.num_token_non_padded,
-                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                    layer_id=self.layer_id,
-                ),
+        with layer_timing_step("router_gate"):
+            if hidden_states.shape[0] > 0:
+                # router_logits: (num_tokens, n_experts)
+                router_logits, _ = self.gate(hidden_states)
+            else:
+                router_logits = None
+        with layer_timing_step("router_topk"):
+            if hidden_states.shape[0] > 0:
+                topk_output = self.topk(
+                    hidden_states,
+                    router_logits,
+                    num_token_non_padded=forward_batch.num_token_non_padded,
+                    expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
+                        layer_id=self.layer_id,
+                    ),
+                )
+            else:
+                topk_output = self.topk.empty_topk_output(hidden_states.device)
+        with layer_timing_step("moe"):
+            final_hidden_states = self.experts(
+                hidden_states=hidden_states,
+                topk_output=topk_output,
             )
-        else:
-            topk_output = self.topk.empty_topk_output(hidden_states.device)
-        final_hidden_states = self.experts(
-            hidden_states=hidden_states,
-            topk_output=topk_output,
-        )
         return final_hidden_states
 
     def op_gate(self, state):
@@ -816,49 +832,62 @@ class Qwen3MoeDecoderLayer(nn.Module):
         captured_last_layer_outputs: Optional[List[torch.Tensor]] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-
-        hidden_states, residual = (
-            self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
-                hidden_states,
-                residual,
-                forward_batch,
-                captured_last_layer_outputs=captured_last_layer_outputs,
-                **kwargs,
-            )
-        )
-
-        if hidden_states.shape[0] != 0:
-            hidden_states = self.self_attn(
-                positions=positions,
-                hidden_states=hidden_states,
-                forward_batch=forward_batch,
+        with layer_timing_layer(self.layer_id):
+            hidden_states, residual = (
+                self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
+                    hidden_states,
+                    residual,
+                    forward_batch,
+                    captured_last_layer_outputs=captured_last_layer_outputs,
+                    **kwargs,
+                )
             )
 
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
-            hidden_states, residual, forward_batch
-        )
+            if hidden_states.shape[0] != 0:
+                with layer_timing_step("attn"):
+                    hidden_states = self.self_attn(
+                        positions=positions,
+                        hidden_states=hidden_states,
+                        forward_batch=forward_batch,
+                    )
 
-        should_allreduce_fusion = (
-            self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
-                forward_batch
-            )
-        )
-
-        # For DP with padding, reduce scatter can be used instead of all-reduce.
-        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
-            forward_batch
-        )
-
-        hidden_states = self.mlp(
-            hidden_states, forward_batch, should_allreduce_fusion, use_reduce_scatter
-        )
-
-        if should_allreduce_fusion:
-            hidden_states._sglang_needs_allreduce_fusion = True
-        else:
-            hidden_states, residual = self.layer_communicator.postprocess_layer(
+            hidden_states, residual = self.layer_communicator.prepare_mlp(
                 hidden_states, residual, forward_batch
             )
+
+            should_allreduce_fusion = (
+                self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
+                    forward_batch
+                )
+            )
+
+            # For DP with padding, reduce scatter can be used instead of all-reduce.
+            use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+                forward_batch
+            )
+
+            if self.is_layer_sparse:
+                hidden_states = self.mlp(
+                    hidden_states,
+                    forward_batch,
+                    should_allreduce_fusion,
+                    use_reduce_scatter,
+                )
+            else:
+                with layer_timing_step("mlp"):
+                    hidden_states = self.mlp(
+                        hidden_states,
+                        forward_batch,
+                        should_allreduce_fusion,
+                        use_reduce_scatter,
+                    )
+
+            if should_allreduce_fusion:
+                hidden_states._sglang_needs_allreduce_fusion = True
+            else:
+                hidden_states, residual = self.layer_communicator.postprocess_layer(
+                    hidden_states, residual, forward_batch
+                )
 
         return hidden_states, residual
 
@@ -1008,13 +1037,17 @@ class Qwen3MoeForCausalLM(nn.Module):
                     extend_seqs_len=forward_batch.extend_seq_lens_cpu,
                 )
 
-        hidden_states = self.model(
-            input_ids,
-            positions,
-            forward_batch,
-            input_embeds,
-            pp_proxy_tensors=pp_proxy_tensors,
-        )
+        layer_timing_begin_forward(forward_batch)
+        try:
+            hidden_states = self.model(
+                input_ids,
+                positions,
+                forward_batch,
+                input_embeds,
+                pp_proxy_tensors=pp_proxy_tensors,
+            )
+        finally:
+            layer_timing_end_forward()
 
         aux_hidden_states = None
         if self.capture_aux_hidden_states:
