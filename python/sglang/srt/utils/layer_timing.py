@@ -64,8 +64,6 @@ _ROUTER_SUBSTEPS: List[str] = [
     "router_predict_launch",
 ]
 # All router substeps that consume wall time on the forward critical path.
-# ``predict_launch`` runs after MoE but still blocks the Python thread before
-# attn starts, so it must count somewhere other than the residual ``other``.
 _ROUTER_CRITICAL_SUBSTEPS = frozenset(
     {
         "router_gate",

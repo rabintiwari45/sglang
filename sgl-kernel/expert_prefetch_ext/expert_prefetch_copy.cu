@@ -6,6 +6,7 @@
 #include <torch/extension.h>
 
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <vector>
 
@@ -151,6 +152,87 @@ void append_expert_row_copies(
   }
 }
 
+void launch_cache_to_buf_hits(
+    const std::vector<at::Tensor>& cache_srcs,
+    const std::vector<at::Tensor>& gpu_buf_dsts,
+    const int64_t* hit_expert_ids,
+    const int64_t* hit_cache_slots,
+    int64_t n,
+    cudaStream_t stream) {
+  if (n == 0 || cache_srcs.empty()) {
+    return;
+  }
+  TORCH_CHECK(cache_srcs.size() == gpu_buf_dsts.size(), "cache/buf tensor count mismatch");
+  for (const auto i : c10::irange(cache_srcs.size())) {
+    const at::Tensor& src = cache_srcs[i];
+    const at::Tensor& dst = gpu_buf_dsts[i];
+    TORCH_CHECK(src.is_cuda() && dst.is_cuda(), "cache->buf hits require CUDA tensors");
+    const int64_t src_pitch = src.stride(0) * src.element_size();
+    const int64_t dst_pitch = dst.stride(0) * dst.element_size();
+    const size_t row_bytes = static_cast<size_t>(
+        (src.numel() / src.size(0)) * src.element_size());
+    const char* src_base = static_cast<const char*>(src.data_ptr());
+    char* dst_base = static_cast<char*>(dst.data_ptr());
+    for (int64_t j = 0; j < n; ++j) {
+      const int64_t e = hit_expert_ids[j];
+      const int64_t s = hit_cache_slots[j];
+      TORCH_CHECK(e >= 0 && e < dst.size(0), "hit expert id out of range: ", e);
+      TORCH_CHECK(s >= 0 && s < src.size(0), "hit cache slot out of range: ", s);
+      C10_CUDA_CHECK(cudaMemcpyAsync(
+          dst_base + e * dst_pitch,
+          src_base + s * src_pitch,
+          row_bytes,
+          cudaMemcpyDeviceToDevice,
+          stream));
+    }
+  }
+}
+
+void launch_buf_to_cache_inserts(
+    const std::vector<at::Tensor>& gpu_buf_dsts,
+    const std::vector<at::Tensor>& cache_dsts,
+    const int64_t* insert_expert_ids,
+    const int64_t* insert_cache_slots,
+    int64_t n,
+    cudaStream_t stream) {
+  if (n == 0 || cache_dsts.empty()) {
+    return;
+  }
+  TORCH_CHECK(gpu_buf_dsts.size() == cache_dsts.size(), "buf/cache tensor count mismatch");
+  for (const auto i : c10::irange(gpu_buf_dsts.size())) {
+    const at::Tensor& src = gpu_buf_dsts[i];
+    const at::Tensor& dst = cache_dsts[i];
+    const int64_t src_pitch = src.stride(0) * src.element_size();
+    const int64_t dst_pitch = dst.stride(0) * dst.element_size();
+    const size_t row_bytes = static_cast<size_t>(
+        (src.numel() / src.size(0)) * src.element_size());
+    const char* src_base = static_cast<const char*>(src.data_ptr());
+    char* dst_base = static_cast<char*>(dst.data_ptr());
+    for (int64_t j = 0; j < n; ++j) {
+      const int64_t e = insert_expert_ids[j];
+      const int64_t s = insert_cache_slots[j];
+      TORCH_CHECK(e >= 0 && e < src.size(0), "insert expert id out of range: ", e);
+      TORCH_CHECK(s >= 0 && s < dst.size(0), "insert cache slot out of range: ", s);
+      C10_CUDA_CHECK(cudaMemcpyAsync(
+          dst_base + s * dst_pitch,
+          src_base + e * src_pitch,
+          row_bytes,
+          cudaMemcpyDeviceToDevice,
+          stream));
+    }
+  }
+}
+
+at::Tensor prepare_ids_cpu_long(const at::Tensor& ids) {
+  if (!ids.defined() || ids.numel() == 0) {
+    return at::empty({0}, at::TensorOptions().dtype(at::kLong).device(at::kCPU));
+  }
+  if (ids.device().is_cpu() && ids.scalar_type() == at::kLong && ids.is_contiguous()) {
+    return ids;
+  }
+  return ids.contiguous().to(at::kCPU, at::kLong);
+}
+
 }  // namespace
 
 void expert_cache_copy(
@@ -282,12 +364,108 @@ void expert_prefetch_copy(
   }
 }
 
+void expert_prefetch_launch(
+    const std::vector<at::Tensor>& cpu_srcs,
+    const std::vector<at::Tensor>& gpu_buf_dsts,
+    const std::vector<at::Tensor>& cache_srcs,
+    const at::Tensor& miss_ids,
+    const at::Tensor& hit_expert_ids,
+    const at::Tensor& hit_cache_slots,
+    const at::Tensor& insert_expert_ids,
+    const at::Tensor& insert_cache_slots) {
+  TORCH_CHECK(cpu_srcs.size() == gpu_buf_dsts.size(), "expert_prefetch_launch: cpu/buf size");
+  TORCH_CHECK(!cpu_srcs.empty(), "expert_prefetch_launch: empty tensor list");
+  if (!cache_srcs.empty()) {
+    TORCH_CHECK(cache_srcs.size() == gpu_buf_dsts.size(), "expert_prefetch_launch: cache/buf size");
+  }
+
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+  at::Tensor miss_cpu = prepare_ids_cpu_long(miss_ids);
+  at::Tensor hit_e_cpu = prepare_ids_cpu_long(hit_expert_ids);
+  at::Tensor hit_s_cpu = prepare_ids_cpu_long(hit_cache_slots);
+  at::Tensor ins_e_cpu = prepare_ids_cpu_long(insert_expert_ids);
+  at::Tensor ins_s_cpu = prepare_ids_cpu_long(insert_cache_slots);
+
+  const int64_t nh = hit_e_cpu.numel();
+  TORCH_CHECK(hit_s_cpu.numel() == nh, "hit expert/slot length mismatch");
+  const int64_t ni = ins_e_cpu.numel();
+  TORCH_CHECK(ins_s_cpu.numel() == ni, "insert expert/slot length mismatch");
+
+  if (nh > 0) {
+    launch_cache_to_buf_hits(
+        cache_srcs,
+        gpu_buf_dsts,
+        hit_e_cpu.data_ptr<int64_t>(),
+        hit_s_cpu.data_ptr<int64_t>(),
+        nh,
+        stream);
+  }
+
+  if (miss_cpu.numel() > 0) {
+    expert_prefetch_copy(cpu_srcs, gpu_buf_dsts, miss_cpu, false);
+  }
+
+  if (ni > 0) {
+    launch_buf_to_cache_inserts(
+        gpu_buf_dsts,
+        cache_srcs,
+        ins_e_cpu.data_ptr<int64_t>(),
+        ins_s_cpu.data_ptr<int64_t>(),
+        ni,
+        stream);
+  }
+}
+
+at::Tensor expert_prefetch_unique_ids(const at::Tensor& ids, int64_t num_experts) {
+  at::Tensor ids_cpu = prepare_ids_cpu_long(ids);
+  const int64_t n = ids_cpu.numel();
+  if (n == 0) {
+    return ids_cpu;
+  }
+  const int64_t* ptr = ids_cpu.data_ptr<int64_t>();
+  std::vector<int64_t> out;
+  out.reserve(static_cast<size_t>(n));
+  for (int64_t i = 0; i < n; ++i) {
+    const int64_t e = ptr[i];
+    if (e < 0 || e >= num_experts) {
+      continue;
+    }
+    bool seen = false;
+    for (int64_t v : out) {
+      if (v == e) {
+        seen = true;
+        break;
+      }
+    }
+    if (!seen) {
+      out.push_back(e);
+    }
+  }
+  if (out.empty()) {
+    return at::empty({0}, at::TensorOptions().dtype(at::kLong).device(at::kCPU));
+  }
+  at::Tensor result = at::empty({static_cast<int64_t>(out.size())}, at::kLong);
+  memcpy(result.data_ptr<int64_t>(), out.data(), out.size() * sizeof(int64_t));
+  return result;
+}
+
 TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("expert_prefetch_copy(Tensor[] srcs, Tensor[] dsts, Tensor expert_ids, bool copy_all) -> ()");
   m.def("expert_cache_copy(Tensor[] srcs, Tensor[] dsts, Tensor src_rows, Tensor dst_rows) -> ()");
+  m.def(
+      "expert_prefetch_launch(Tensor[] cpu_srcs, Tensor[] gpu_buf_dsts, Tensor[] cache_srcs, "
+      "Tensor miss_ids, Tensor hit_expert_ids, Tensor hit_cache_slots, "
+      "Tensor insert_expert_ids, Tensor insert_cache_slots) -> ()");
+  m.def("expert_prefetch_unique_ids(Tensor ids, int num_experts) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(sgl_kernel, CUDA, m) {
   m.impl("expert_prefetch_copy", &expert_prefetch_copy);
   m.impl("expert_cache_copy", &expert_cache_copy);
+  m.impl("expert_prefetch_launch", &expert_prefetch_launch);
+}
+
+TORCH_LIBRARY_IMPL(sgl_kernel, CPU, m) {
+  m.impl("expert_prefetch_unique_ids", &expert_prefetch_unique_ids);
 }

@@ -1099,6 +1099,9 @@ class Qwen3MoeForCausalLM(nn.Module):
                 pp_proxy_tensors=pp_proxy_tensors,
             )
         finally:
+            prefetcher = get_expert_prefetcher()
+            if prefetcher is not None:
+                prefetcher.flush_launches_remaining()
             layer_timing_end_forward()
 
         aux_hidden_states = None

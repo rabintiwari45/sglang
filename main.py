@@ -46,7 +46,7 @@ def main() -> None:
 
     print("Model loaded successfully.")
 
-    outputs = llm.generate("Hello, how are you?", sampling_params={"max_new_tokens": 20})
+    outputs = llm.generate("Hello, how are you?", sampling_params={"max_new_tokens": 100})
     print("--------------------------------")
     print("Outputs:")
     print(outputs)

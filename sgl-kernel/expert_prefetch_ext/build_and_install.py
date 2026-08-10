@@ -74,8 +74,6 @@ def expert_prefetch_copy(
     shutil.copy2(wrapper_src, dst_wrapper)
     print(f"Installed wrapper -> {dst_wrapper}")
 
-    # Ensure the compiled .so stays loadable.  Copy into package and add a
-    # tiny import hook in expert_prefetch.py that loads it if needed.
     so_candidates = list(build_dir.glob("sgl_expert_prefetch_ops*.so"))
     if not so_candidates:
         print("WARNING: could not find built .so in", build_dir, file=sys.stderr)
@@ -85,80 +83,6 @@ def expert_prefetch_copy(
     shutil.copy2(so_src, so_dst)
     print(f"Installed extension -> {so_dst}")
 
-    # Rewrite wrapper to load the .so before calling the op.
-    dst_wrapper.write_text(
-        f'''from typing import List
-
-import torch
-
-
-def _ensure_op_loaded() -> None:
-    if hasattr(torch.ops.sgl_kernel, "expert_prefetch_copy"):
-        return
-    from pathlib import Path
-    import importlib.util
-
-    so = Path(__file__).resolve().parent / "{so_src.name}"
-    spec = importlib.util.spec_from_file_location("sgl_expert_prefetch_ops", so)
-    if spec is None or spec.loader is None:
-        raise ImportError(f"cannot load expert_prefetch extension from {{so}}")
-    importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(importlib.util.module_from_spec(spec))  # type: ignore[arg-type]
-
-
-def expert_prefetch_copy(
-    srcs: List[torch.Tensor],
-    dsts: List[torch.Tensor],
-    expert_ids: torch.Tensor,
-    copy_all: bool = False,
-) -> None:
-    """Batch H2D copy of MoE expert rows for router-predicted prefetch."""
-    _ensure_op_loaded()
-    torch.ops.sgl_kernel.expert_prefetch_copy.default(
-        srcs, dsts, expert_ids, copy_all
-    )
-'''
-    )
-    # Fix the loader: exec_module needs the module object.
-    dst_wrapper.write_text(
-        f'''from typing import List
-from pathlib import Path
-import importlib.util
-
-import torch
-
-_LOADED = False
-
-
-def _ensure_op_loaded() -> None:
-    global _LOADED
-    if _LOADED:
-        return
-    try:
-        _ = torch.ops.sgl_kernel.expert_prefetch_copy
-        _LOADED = True
-        return
-    except (AttributeError, RuntimeError):
-        pass
-    so = Path(__file__).resolve().parent / "{so_src.name}"
-    torch.ops.load_library(str(so))
-    _ = torch.ops.sgl_kernel.expert_prefetch_copy
-    _LOADED = True
-
-
-def expert_prefetch_copy(
-    srcs: List[torch.Tensor],
-    dsts: List[torch.Tensor],
-    expert_ids: torch.Tensor,
-    copy_all: bool = False,
-) -> None:
-    """Batch H2D copy of MoE expert rows for router-predicted prefetch."""
-    _ensure_op_loaded()
-    torch.ops.sgl_kernel.expert_prefetch_copy.default(
-        srcs, dsts, expert_ids, copy_all
-    )
-'''
-    )
     print("Done.")
     return 0
 

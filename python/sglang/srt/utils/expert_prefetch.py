@@ -6,19 +6,11 @@ launch-bound decode loop and inflates every layer.
 
 For each MoE layer L:
 
-  1. ``before_experts(L)``: wait/bind L's expert buffer (GPU-side event wait);
-     enqueue gate+topk prediction kernels for the next offloaded layers
-     (usually just L+2) plus an async D2H copy of the predicted expert ids
-     into a pinned ring slot (CUDA event recorded, no host sync).
-  2. MoE(L) runs.
-  3. ``after_experts(L)``: record "L's buffer free" event; then process the
-     prediction made in step 1: the id-copy event has already fired (the MoE
-     timing sync passed it), so reading the pinned ids costs nothing.  Expert
-     rows already in the per-layer GPU cache are restored with device-to-device
-     memcpys; missing rows are fetched from contiguous pinned CPU memory with
-     one batched H2D call and inserted into the LRU cache.  All copies run on
-     the transfer stream guarded by per-buffer CUDA events -- no stream-wide
-     synchronization -- so the H2D overlaps MoE(L)..attn(L+2) compute.
+  1. ``before_experts(L)``: bind L; enqueue gate+topk for the next offloaded
+     layer on ``_predict_stream`` (overlaps MoE(L)).
+  2. MoE(L) on the main stream.
+  3. ``after_experts(L)``: buffer-free event; enqueue H2D on the transfer
+     stream for predictions from L (overlaps subsequent GPU work when possible).
 
 The per-layer GPU expert cache is the key addition over pure prefetch: PCIe
 H2D bandwidth (~8 GB/s measured on this host) makes a full 8-expert layer
@@ -43,6 +35,23 @@ import torch
 from sglang.srt.utils.layer_timing import step as layer_timing_step
 
 logger = logging.getLogger(__name__)
+
+
+def _unique_valid_expert_ids_list(host: np.ndarray, num_experts: int) -> List[int]:
+    if host.size == 0:
+        return []
+    if host.size <= 32:
+        seen: Set[int] = set()
+        out: List[int] = []
+        for v in host.flat:
+            e = int(v)
+            if 0 <= e < num_experts and e not in seen:
+                seen.add(e)
+                out.append(e)
+        return out
+    u = np.unique(host)
+    return [int(e) for e in u if 0 <= e < num_experts]
+
 
 # How many offloaded layers to prefetch ahead of the current MoE.
 _DEFAULT_PREFETCH_LAYERS = 2
@@ -116,6 +125,7 @@ class ExpertPrefetcher:
         self._initialized = False
         self._device: Optional[torch.device] = None
         self._transfer_stream: Optional[torch.cuda.Stream] = None
+        self._predict_stream: Optional[torch.cuda.Stream] = None
 
         self._param_names: List[str] = []
         self._cpu_store: Dict[int, Dict[str, torch.Tensor]] = {}
@@ -137,6 +147,8 @@ class ExpertPrefetcher:
         # Per-layer transfer-complete CUDA events.
         self._xfer_events: Dict[int, torch.cuda.Event] = {}
         self._predicted_topk: Dict[int, object] = {}
+        # Set when gate+topk for ``layer_id`` finishes on ``_predict_stream``.
+        self._predict_ready: Dict[int, torch.cuda.Event] = {}
         # Predictions awaiting DMA enqueue: list of dicts.
         self._pending: List[dict] = []
 
@@ -149,6 +161,11 @@ class ExpertPrefetcher:
         self._ids_ring_np = None
         self._ids_ring_events: List[torch.cuda.Event] = []
         self._ids_ring_free: deque = deque()
+
+        # Decode-sized pinned buffer for expert ids (avoids ring + host sync).
+        self._ids_fast_pin: Optional[torch.Tensor] = None
+        self._ids_fast_np: Optional[np.ndarray] = None
+        self._ids_fast_cap = 128
 
         # Shared pinned index staging (values are consumed on the host at
         # enqueue time by the copy ops, so one set is enough).
@@ -171,10 +188,14 @@ class ExpertPrefetcher:
             from sgl_kernel.expert_prefetch import (  # noqa: F401
                 expert_cache_copy,
                 expert_prefetch_copy,
+                expert_prefetch_launch,
+                expert_prefetch_unique_ids,
             )
 
             self._use_batch_copy = True
-            logger.info("[expert_prefetch] using sgl_kernel batched copies")
+            logger.info(
+                "[expert_prefetch] using sgl_kernel batched copies + launch"
+            )
         except (ImportError, AttributeError, RuntimeError):
             self._use_batch_copy = False
             logger.info(
@@ -182,6 +203,10 @@ class ExpertPrefetcher:
                 "using per-row copies"
             )
         return self._use_batch_copy
+
+    @staticmethod
+    def _empty_ids_pin() -> torch.Tensor:
+        return torch.empty(0, dtype=torch.long, pin_memory=True)
 
     def _detect_param_names(self, experts: torch.nn.Module) -> List[str]:
         names = []
@@ -201,6 +226,7 @@ class ExpertPrefetcher:
         if self._device.index is None:
             self._device = torch.device("cuda", torch.cuda.current_device())
         self._transfer_stream = torch.cuda.Stream(device=self._device)
+        self._predict_stream = torch.cuda.Stream(device=self._device)
 
         sparse_layer_ids = [
             i for i, layer in enumerate(self.layers) if self._is_sparse(layer)
@@ -296,6 +322,11 @@ class ExpertPrefetcher:
         ]
         self._ids_ring_free = deque(range(_IDS_RING_SLOTS))
 
+        self._ids_fast_pin = torch.empty(
+            self._ids_fast_cap, dtype=torch.long, pin_memory=True
+        )
+        self._ids_fast_np = self._ids_fast_pin.numpy()
+
         # Shared pinned index staging.  The copy ops read the row indices on
         # the host at enqueue time, so the staging can be reused immediately
         # after each call returns.
@@ -341,8 +372,32 @@ class ExpertPrefetcher:
     def _expert_ids_cpu(self, topk_ids: torch.Tensor) -> List[int]:
         flat = topk_ids.detach().reshape(-1)
         host = flat.to("cpu", dtype=torch.long, non_blocking=False).numpy()
-        ids = np.unique(host)
-        return [int(e) for e in ids if 0 <= e < self.num_experts]
+        return _unique_valid_expert_ids_list(host, self.num_experts)
+
+    def _wait_predict_ready(self, layer_id: int) -> None:
+        ev = self._predict_ready.pop(layer_id, None)
+        if ev is not None:
+            torch.cuda.current_stream().wait_event(ev)
+
+    def _split_hits_misses(
+        self, layer_id: int, ids: List[int]
+    ) -> Tuple[List[int], List[int]]:
+        cache = self._cache.get(layer_id)
+        if cache is None:
+            return [], list(ids)
+        id2slot = cache.id2slot
+        hits: List[int] = []
+        misses: List[int] = []
+        for e in ids:
+            if e in id2slot:
+                hits.append(e)
+            else:
+                misses.append(e)
+        if hits:
+            lru = cache.lru
+            for e in hits:
+                lru.move_to_end(e)
+        return hits, misses
 
     def _next_offloaded_layers(self, layer_id: int, n: int) -> List[int]:
         """Return up to ``n`` offloaded layer ids strictly after ``layer_id``."""
@@ -379,6 +434,7 @@ class ExpertPrefetcher:
                 return topk(hidden_states, router_logits)
 
         if layer_id in self._predicted_topk:
+            self._wait_predict_ready(layer_id)
             topk_output = self._predicted_topk.pop(layer_id)
             with layer_timing_step("router_bind"):
                 self._wait_and_bind(layer_id)
@@ -395,7 +451,6 @@ class ExpertPrefetcher:
                     self._enqueue_transfer(layer_id, ids)
                     self._wait_and_bind(layer_id)
 
-        # Predict any of the next N offloaded layers not already in flight.
         for target in self._next_offloaded_layers(
             layer_id, self.num_prefetch_layers
         ):
@@ -421,61 +476,111 @@ class ExpertPrefetcher:
         self._pending = [p for p in self._pending if p["from_layer"] != layer_id]
         with layer_timing_step("router_predict_launch"):
             for item in mine:
-                ids = item["ids"]
-                if ids is None:
-                    # The id-copy event has fired by now (the MoE timing sync
-                    # passed the prediction kernels), so this wait is ~free.
-                    item["event"].synchronize()
-                    slot = item["slot"]
-                    raw = self._ids_ring_np[slot, : item["n_ids"]]
-                    ids_arr = np.unique(raw)
-                    self._ids_ring_free.append(slot)
-                    ids = [
-                        int(e) for e in ids_arr if 0 <= e < self.num_experts
-                    ]
+                ids = self._pending_ids(item)
                 self._enqueue_transfer(item["layer_id"], ids)
+
+    def flush_launches_remaining(self) -> None:
+        """Drain any pending launches (e.g. last MoE layer)."""
+        if not self._initialized or not self._pending:
+            return
+        from_layers = sorted({p["from_layer"] for p in self._pending})
+        for fl in from_layers:
+            mine = [p for p in self._pending if p["from_layer"] == fl]
+            self._pending = [p for p in self._pending if p["from_layer"] != fl]
+            with layer_timing_step("router_predict_launch"):
+                for item in mine:
+                    ids = self._pending_ids(item)
+                    self._enqueue_transfer(item["layer_id"], ids)
+
+    def _pending_ids(self, item: dict) -> List[int]:
+        ids = item.get("ids")
+        if ids is not None:
+            return ids
+        ev = item["event"]
+        torch.cuda.current_stream().wait_event(ev)
+        use_native = self._resolve_batch_copy()
+        if item.get("defer_ids"):
+            topk = self._predicted_topk.get(item["layer_id"])
+            if topk is not None:
+                return self._expert_ids_cpu(topk.topk_ids)
+            return []
+        if item.get("fast"):
+            n = item["n_ids"]
+            raw = self._ids_fast_np[:n]
+            if use_native:
+                from sgl_kernel.expert_prefetch import expert_prefetch_unique_ids_list
+
+                return expert_prefetch_unique_ids_list(
+                    torch.from_numpy(raw.copy()), self.num_experts
+                )
+            return _unique_valid_expert_ids_list(raw, self.num_experts)
+        slot = item["slot"]
+        n = item["n_ids"]
+        raw = self._ids_ring_np[slot, :n]
+        self._ids_ring_free.append(slot)
+        if use_native:
+            from sgl_kernel.expert_prefetch import expert_prefetch_unique_ids_list
+
+            return expert_prefetch_unique_ids_list(
+                torch.from_numpy(raw.copy()), self.num_experts
+            )
+        return _unique_valid_expert_ids_list(raw, self.num_experts)
 
     def _predict(
         self, layer_id: int, hidden_states: torch.Tensor, from_layer: int
     ) -> None:
         gate = self._get_gate(self.layers[layer_id])
         topk_mod = self._get_topk(self.layers[layer_id])
-        with torch.no_grad():
-            with layer_timing_step("router_predict_gate"):
-                router_logits, _ = gate(hidden_states)
-            with layer_timing_step("router_predict_topk"):
-                topk_output = topk_mod(hidden_states, router_logits)
+        ready = torch.cuda.Event()
+        self._predict_ready[layer_id] = ready
+        stream = self._predict_stream
+        assert stream is not None
 
-        self._predicted_topk[layer_id] = topk_output
+        with torch.cuda.stream(stream):
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.no_grad():
+                with layer_timing_step("router_predict_gate"):
+                    router_logits, _ = gate(hidden_states)
+                with layer_timing_step("router_predict_topk"):
+                    topk_output = topk_mod(hidden_states, router_logits)
 
-        flat = topk_output.topk_ids.detach().reshape(-1)
-        n = flat.numel()
-        if n <= _IDS_SLOT_CAP and self._ids_ring_free:
-            slot = self._ids_ring_free.popleft()
-            # Async D2H into pinned ring; consumed in after_experts.
-            self._ids_ring[slot, :n].copy_(flat.to(torch.long), non_blocking=True)
-            ev = self._ids_ring_events[slot]
-            ev.record()
-            self._pending.append(
-                {
-                    "layer_id": layer_id,
-                    "from_layer": from_layer,
-                    "ids": None,
-                    "slot": slot,
-                    "n_ids": n,
-                    "event": ev,
-                }
-            )
-        else:
-            # Large batch (prefill) or ring exhausted: sync extraction.
-            ids = self._expert_ids_cpu(topk_output.topk_ids)
-            self._pending.append(
-                {
-                    "layer_id": layer_id,
-                    "from_layer": from_layer,
-                    "ids": ids,
-                }
-            )
+            self._predicted_topk[layer_id] = topk_output
+
+            flat = topk_output.topk_ids.detach().reshape(-1)
+            n = int(flat.numel())
+            pending: dict = {
+                "layer_id": layer_id,
+                "from_layer": from_layer,
+            }
+            if n <= self._ids_fast_cap and n > 0:
+                self._ids_fast_pin[:n].copy_(flat.to(torch.long), non_blocking=True)
+                ready.record(stream)
+                pending.update(
+                    {
+                        "ids": None,
+                        "fast": True,
+                        "n_ids": n,
+                        "event": ready,
+                    }
+                )
+            elif n <= _IDS_SLOT_CAP and self._ids_ring_free:
+                slot = self._ids_ring_free.popleft()
+                self._ids_ring[slot, :n].copy_(flat.to(torch.long), non_blocking=True)
+                ready.record(stream)
+                pending.update(
+                    {
+                        "ids": None,
+                        "slot": slot,
+                        "n_ids": n,
+                        "event": ready,
+                    }
+                )
+            else:
+                ready.record(stream)
+                pending["event"] = ready
+                pending["defer_ids"] = True
+
+            self._pending.append(pending)
 
     def _wait_and_bind(self, layer_id: int) -> None:
         torch.cuda.current_stream().wait_event(self._xfer_events[layer_id])
@@ -488,74 +593,90 @@ class ExpertPrefetcher:
 
     def _enqueue_transfer(self, layer_id: int, ids: List[int]) -> None:
         """Enqueue cache restores + H2D for ``ids`` on the transfer stream."""
+        if not ids:
+            return
+        hits, misses = self._split_hits_misses(layer_id, ids)
         cache = self._cache.get(layer_id)
-        hits: List[int] = []
-        misses: List[int] = []
-        if cache is not None:
-            id2slot = cache.id2slot
-            for e in ids:
-                if e in id2slot:
-                    hits.append(e)
-                else:
-                    misses.append(e)
-            lru = cache.lru
-            for e in hits:
-                lru.move_to_end(e)
-        else:
-            misses = list(ids)
-
         buf_idx = self._layer_buf[layer_id]
         buf_list = self._buffer_lists[buf_idx]
         use_batch = self._resolve_batch_copy()
 
+        if hits:
+            nh = len(hits)
+            id2slot = cache.id2slot  # type: ignore[union-attr]
+            self._stage_np["hit_ids"][:nh] = hits
+            for i, e in enumerate(hits):
+                self._stage_np["hit_slots"][i] = id2slot[e]
+
+        ins_ids: List[int] = []
+        ins_slots: List[int] = []
+        if misses:
+            nm = len(misses)
+            self._stage_np["miss"][:nm] = misses
+            if cache is not None:
+                victims = self._alloc_cache_slots(cache, misses, ids)
+                nv = len(victims)
+                if nv:
+                    ins_ids = misses[:nv]
+                    ins_slots = victims
+                    self._stage_np["ins_ids"][:nv] = ins_ids
+                    self._stage_np["ins_slots"][:nv] = ins_slots
+                    id2slot = cache.id2slot
+                    lru = cache.lru
+                    for e, s in zip(ins_ids, ins_slots):
+                        id2slot[e] = s
+                        lru[e] = None
+
+        empty = self._empty_ids_pin()
+        cache_list = self._cache_lists.get(layer_id, [])
+
         with torch.cuda.stream(self._transfer_stream):
-            # Do not overwrite the buffer before its previous MoE finished.
             self._transfer_stream.wait_event(self._buf_ready[buf_idx])
 
-            if hits:
-                nh = len(hits)
-                self._stage_np["hit_ids"][:nh] = hits
-                self._stage_np["hit_slots"][:nh] = [
-                    cache.id2slot[e] for e in hits
-                ]
-                self._d2d_rows(
-                    self._cache_lists[layer_id],
-                    buf_list,
-                    self._stage["hit_slots"][:nh],
-                    self._stage["hit_ids"][:nh],
-                    use_batch,
-                )
+            if use_batch:
+                from sgl_kernel.expert_prefetch import expert_prefetch_launch
 
-            if misses:
+                nh = len(hits)
                 nm = len(misses)
-                self._stage_np["miss"][:nm] = misses
-                self._h2d_rows(
+                ni = len(ins_ids)
+                expert_prefetch_launch(
                     self._cpu_lists[layer_id],
                     buf_list,
-                    self._stage["miss"][:nm],
-                    misses,
-                    use_batch,
+                    cache_list,
+                    self._stage["miss"][:nm] if nm else empty,
+                    self._stage["hit_ids"][:nh] if nh else empty,
+                    self._stage["hit_slots"][:nh] if nh else empty,
+                    self._stage["ins_ids"][:ni] if ni else empty,
+                    self._stage["ins_slots"][:ni] if ni else empty,
                 )
-
-                if cache is not None:
-                    victims = self._alloc_cache_slots(cache, misses, ids)
-                    nv = len(victims)
-                    if nv:
-                        ins = misses[:nv]
-                        self._stage_np["ins_ids"][:nv] = ins
-                        self._stage_np["ins_slots"][:nv] = victims
+            else:
+                if hits:
+                    nh = len(hits)
+                    self._d2d_rows(
+                        cache_list,
+                        buf_list,
+                        self._stage["hit_slots"][:nh],
+                        self._stage["hit_ids"][:nh],
+                        use_batch,
+                    )
+                if misses:
+                    nm = len(misses)
+                    self._h2d_rows(
+                        self._cpu_lists[layer_id],
+                        buf_list,
+                        self._stage["miss"][:nm],
+                        misses,
+                        use_batch,
+                    )
+                    if ins_ids:
+                        ni = len(ins_ids)
                         self._d2d_rows(
                             buf_list,
-                            self._cache_lists[layer_id],
-                            self._stage["ins_ids"][:nv],
-                            self._stage["ins_slots"][:nv],
+                            cache_list,
+                            self._stage["ins_ids"][:ni],
+                            self._stage["ins_slots"][:ni],
                             use_batch,
                         )
-                        id2slot = cache.id2slot
-                        lru = cache.lru
-                        for e, s in zip(ins, victims):
-                            id2slot[e] = s
-                            lru[e] = None
 
             self._xfer_events[layer_id].record(self._transfer_stream)
 

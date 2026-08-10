@@ -52,9 +52,10 @@ echo "[install] verify"
 python -c "
 import sglang
 import sgl_kernel
-from sgl_kernel.expert_prefetch import expert_prefetch_copy
+from sgl_kernel.expert_prefetch import expert_prefetch_copy, expert_prefetch_launch
 print('sglang OK', getattr(sglang, '__version__', '?'))
 print('expert_prefetch_copy OK')
+print('expert_prefetch_launch OK')
 "
 
 echo "[install] done — run: cd ${ROOT} && python main.py"
